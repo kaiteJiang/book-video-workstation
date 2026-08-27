@@ -1,0 +1,13 @@
+{
+  "repository_url": "https://github.com/gnipbao/story-to-handdrawn-video",
+  "commit": "fbab5b27f4f0db61739d86f78000a39eeaa692d3",
+  "license": "MIT",
+  "imported_at": "2026-08-22",
+  "local_changes": [
+    "9:16 output",
+    "absolute-frame timeline",
+    "font-rendered short key line",
+    "explicit storyboard input props",
+    "transitive dependency security patches"
+  ]
+}

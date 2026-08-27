@@ -1,0 +1,15 @@
+[Script Info]
+; BV_TASK17_SUBTITLE_TEMPLATE_V1
+; Safe area: Alignment,2; MarginV,220
+ScriptType: v4.00+
+PlayResX: __PLAY_RES_X__
+PlayResY: __PLAY_RES_Y__
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: BV_Task17_Default,__FONT_FAMILY__,68,&H00FFFFFF,&H000000FF,&H00101010,&H78000000,-1,0,0,0,100,100,0,0,3,10,0,2,84,84,220,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text

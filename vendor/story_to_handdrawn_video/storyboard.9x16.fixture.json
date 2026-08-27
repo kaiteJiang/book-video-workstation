@@ -1,0 +1,63 @@
+{
+  "project": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "ratio": "9:16",
+    "total_frames": 450,
+    "transition": "page-flip",
+    "transition_frames": 18
+  },
+  "safe_area": {
+    "top_reserved": 140,
+    "keyline_top": 140,
+    "keyline_bottom": 340,
+    "illustration_top": 340,
+    "illustration_bottom": 1460,
+    "subtitle_top": 1460,
+    "subtitle_bottom": 1660,
+    "bottom_reserved": 260,
+    "right_reserved": 180
+  },
+  "scenes": [
+    {
+      "id": "S01",
+      "start_ms": 0,
+      "end_ms": 5000,
+      "from_frame": 0,
+      "to_frame": 150,
+      "key_line": "困在别人的眼光里",
+      "narration": "有时候真正让人疲惫的，不是生活本身，而是总想活成别人期待的样子。",
+      "assets": {
+        "bw": "assets/02_bw.svg",
+        "color": "assets/02_color.svg"
+      }
+    },
+    {
+      "id": "S02",
+      "start_ms": 5000,
+      "end_ms": 10000,
+      "from_frame": 150,
+      "to_frame": 300,
+      "key_line": "一本书让人转身",
+      "narration": "一本真正有价值的书，不替你决定人生，而是帮你看清那些一直绑住自己的念头。",
+      "assets": {
+        "bw": "assets/03_bw.svg",
+        "color": "assets/03_color.svg"
+      }
+    },
+    {
+      "id": "S03",
+      "start_ms": 10000,
+      "end_ms": 15000,
+      "from_frame": 300,
+      "to_frame": 450,
+      "key_line": "把人生还给自己",
+      "narration": "读完以后，世界没有突然改变，但你终于愿意把自己的人生重新拿回来。",
+      "assets": {
+        "bw": "assets/02_bw.svg",
+        "color": "assets/02_color.svg"
+      }
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+workspace_dir: workspace
+voice_path: workspace/voices/reference_voice.wav
+subtitle_font_path: 'C:\Windows\Fonts\msyhbd.ttc'
+subtitle_font_family: Microsoft YaHei
+codex:
+  command: codex
+  timeout_seconds: 1800
+grok:
+  command: grok
+  timeout_seconds: 600
+  blocking: false
+indextts2:
+  uv_command: uv
+  install_dir: 'D:\Program Files (x86)\index-tts'
+  model_dir: 'D:\Program Files (x86)\index-tts\checkpoints'
+  device: cuda
+  voice_id: 黑金3
+ffmpeg:
+  command: 'D:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe'
+  ffprobe_command: 'D:\Program Files (x86)\ffmpeg\bin\ffprobe.exe'
+volc_asr:
+  endpoint: https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash
+  resource_id: volc.bigasr.auc_turbo
+  api_key_env: BV_VOLC_ASR_API_KEY
+  app_key_env: BV_VOLC_ASR_APP_KEY
+  access_key_env: BV_VOLC_ASR_ACCESS_KEY
+video:
+  width: 1080
+  height: 1920
+  frame_rate: 30
+  final_min_seconds: 45.0
+  final_max_seconds: 60.0
+  segment_target_seconds: 15.0
+  segment_max_seconds: 15.5
+video_generation:
+  provider: grok_cli
+  resolution: 480p
+  command: grok
+  timeout_seconds: 900
+audio:
+  hard_min_seconds: 45.0
+  ideal_min_seconds: 48.0
+  ideal_max_seconds: 56.0
+  hard_max_seconds: 60.0
+  voice_lufs: -18.0
+  final_lufs: -16.0
+  true_peak_db: -1.5
+  silence_threshold_db: -45.0
+  removable_edge_silence_ms: 300
+h3:
+  mode: manual_import
+handdrawn:
+  vendor_dir: vendor/story_to_handdrawn_video
+  node_command: npm
+  width: 1080
+  height: 1920
+  fps: 30
+  representative_count: 3
+  image_size: 1080x1920
+  text_mode: font
+  transition: cross-dissolve
+  safe_area:
+    top_reserved: 140
+    keyline_top: 140
+    keyline_bottom: 340
+    illustration_top: 340
+    illustration_bottom: 1460
+    subtitle_top: 1460
+    subtitle_bottom: 1660
+    bottom_reserved: 260
+    right_reserved: 180
