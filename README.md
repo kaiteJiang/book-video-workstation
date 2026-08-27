@@ -236,10 +236,11 @@ git diff --check
 测试覆盖内容合同、运行时授权、TTS/ASR 边界、音频规范化、字幕、四图分镜、代表图门禁、Remotion 渲染、FFmpeg 合成、封面和最终批准记录。真实云端账号、额度和审美判断仍需使用者自行验收。
 
 ## 许可证与致谢
+借鉴了 @gnipbao 大佬的插画开源项目，特此感谢。
 
 项目主体采用 [MIT License](LICENSE)。内置渲染器、画风定义和字体保留各自许可证，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-欢迎提交范围明确的 Issue 和 Pull Request。参与前请先读 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [SECURITY.md](SECURITY.md)。
+欢迎大家去二创完善，任何一个模块都是可以自定义修改 替换 甚至开发升级的。期待大家的版本，记得回来@我分享！
 
 <div align="center">
 
