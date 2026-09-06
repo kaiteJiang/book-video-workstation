@@ -27,7 +27,7 @@
     "validate": "node scripts/validate-storyboard.mjs",
     "check": "npm run check:types && npm run check:storyboard",
     "check:types": "tsc --noEmit",
-    "check:storyboard": "npm run validate -- --input storyboard.9x16.fixture.json"
+    "check:storyboard": "npm run validate -- --input storyboard.9x16.fixture.json storyboard.story-pair.fixture.json"
   },
   "dependencies": {
     "@remotion/cli": "4.0.487",

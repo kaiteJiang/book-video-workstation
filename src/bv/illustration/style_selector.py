@@ -234,6 +234,38 @@ def style_candidates_with_override(
     return selected, alternatives[0], alternatives[1]
 
 
+def manual_style_decision(
+    catalog: Sequence[StyleRecipe],
+    *,
+    style_id: str,
+    source_script_sha256: str,
+) -> StyleDecision:
+    """Create a catalog-bound user override without consulting a model."""
+    selected = next((item for item in catalog if item.style_id == style_id), None)
+    alternatives = tuple(item for item in catalog if item.style_id != style_id)[:2]
+    if selected is None or len(alternatives) != 2:
+        raise StyleSelectionError("style_not_in_catalog")
+    if len(source_script_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in source_script_sha256
+    ):
+        raise StyleSelectionError("invalid_style_source")
+    candidate_ids = (selected.style_id, alternatives[0].style_id, alternatives[1].style_id)
+    return _decision(
+        selected_style=selected.style_id,
+        candidate_ids=candidate_ids,
+        selection_reasons=("用户明确指定此插画风格",),
+        rejected_reasons={
+            candidate.style_id: "未采用，用户已明确指定其他风格"
+            for candidate in alternatives
+        },
+        confidence=1.0,
+        approved_script=source_script_sha256,
+        manual_override=True,
+        recipe_sha256=_canonical_sha(selected.model_dump(mode="json")),
+        source_script_sha256=source_script_sha256,
+    )
+
+
 def select_style(
     profile: NarrativeProfile,
     approved_script: str,
@@ -409,6 +441,7 @@ def _decision(
     approved_script: str,
     manual_override: bool,
     recipe_sha256: str,
+    source_script_sha256: str | None = None,
 ) -> StyleDecision:
     fingerprint_payload = {
         "library_version": _LIBRARY_VERSION,
@@ -423,7 +456,11 @@ def _decision(
         rejected_reasons=dict(rejected_reasons),
         confidence=confidence,
         manual_override=manual_override,
-        source_script_sha256=_sha(approved_script),
+        source_script_sha256=(
+            _sha(approved_script)
+            if source_script_sha256 is None
+            else source_script_sha256
+        ),
         style_fingerprint=_canonical_sha(fingerprint_payload),
     )
 

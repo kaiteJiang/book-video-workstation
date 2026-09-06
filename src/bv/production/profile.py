@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+VisualSequenceMode = Literal[
+    "legacy-monochrome-reveal",
+    "color-story-pair",
+]
 
 
 class ProductionProfileError(RuntimeError):
@@ -74,6 +81,7 @@ class VisualProfile(_ProfileModel):
     seconds_per_scene_max: float = Field(gt=0)
     representative_count: Literal[3]
     transition: Literal["cross-dissolve"]
+    sequence_mode: VisualSequenceMode = "legacy-monochrome-reveal"
     scene_count: int | None = Field(default=None, ge=3, le=24)
     style_id: str | None = None
 
@@ -152,6 +160,7 @@ class ProductionProfile(_ProfileModel):
                 seconds_per_scene_max=11.25,
                 representative_count=3,
                 transition="cross-dissolve",
+                sequence_mode="color-story-pair",
                 scene_count=4,
                 style_id="retro-gouache-concept",
             ),
@@ -182,6 +191,8 @@ class ProductionProfile(_ProfileModel):
                 seconds_per_scene_max=11.0,
                 representative_count=3,
                 transition="cross-dissolve",
+                sequence_mode="color-story-pair",
+                scene_count=4,
             ),
             delivery=DeliveryProfile(
                 timezone="Asia/Shanghai",
@@ -209,6 +220,7 @@ LEGACY_PRODUCTION_PROFILE = ProductionProfile(
         seconds_per_scene_max=7.0,
         representative_count=3,
         transition="cross-dissolve",
+        sequence_mode="legacy-monochrome-reveal",
     ),
     delivery=DeliveryProfile(
         timezone="Asia/Shanghai",
@@ -243,7 +255,11 @@ def production_profile_sha256(episode_root: Path) -> str:
             return hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
             raise ProductionProfileError("production_profile_read_failed") from None
-    canonical = profile.model_dump_json(exclude_none=True)
+    payload = profile.model_dump(mode="json", exclude_none=True)
+    visual = payload.get("visual")
+    if isinstance(visual, dict):
+        visual.pop("sequence_mode", None)
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

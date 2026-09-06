@@ -1,0 +1,70 @@
+{
+  "project": {
+    "width": 1080,
+    "height": 1920,
+    "fps": 30,
+    "ratio": "9:16",
+    "total_frames": 450,
+    "transition": "cross-dissolve",
+    "transition_frames": 15,
+    "ink_reveal_frames": 45
+  },
+  "safe_area": {
+    "top_reserved": 140,
+    "keyline_top": 140,
+    "keyline_bottom": 340,
+    "illustration_top": 340,
+    "illustration_bottom": 1460,
+    "subtitle_top": 1460,
+    "subtitle_bottom": 1660,
+    "bottom_reserved": 260,
+    "right_reserved": 180
+  },
+  "scenes": [
+    {
+      "id": "S01",
+      "start_ms": 0,
+      "end_ms": 5000,
+      "from_frame": 0,
+      "to_frame": 150,
+      "key_line": "第一段剧情推进",
+      "narration": "第一段测试旁白。",
+      "sequence_mode": "color-story-pair",
+      "semantic_turn_frame": 45,
+      "assets": {
+        "anchor": "assets/02_color.svg",
+        "continuation": "assets/03_color.svg"
+      }
+    },
+    {
+      "id": "S02",
+      "start_ms": 5000,
+      "end_ms": 10000,
+      "from_frame": 150,
+      "to_frame": 300,
+      "key_line": "第二段剧情推进",
+      "narration": "第二段测试旁白。",
+      "sequence_mode": "color-story-pair",
+      "semantic_turn_frame": 195,
+      "assets": {
+        "anchor": "assets/03_color.svg",
+        "continuation": "assets/02_color.svg"
+      }
+    },
+    {
+      "id": "S03",
+      "start_ms": 10000,
+      "end_ms": 15000,
+      "from_frame": 300,
+      "to_frame": 450,
+      "key_line": "第三段剧情推进",
+      "narration": "第三段测试旁白。",
+      "sequence_mode": "color-story-pair",
+      "semantic_turn_frame": 345,
+      "assets": {
+        "anchor": "assets/02_color.svg",
+        "continuation": "assets/03_color.svg"
+      }
+    }
+  ]
+}

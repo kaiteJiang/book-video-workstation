@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from bv.illustration.assets import import_image_master, prepare_image_jobs
+from bv.illustration.assets import (
+    ImageJob,
+    IllustrationManifest,
+    import_image_master,
+    prepare_image_jobs,
+    record_imported_image,
+)
 from bv.illustration.contracts import CharacterLock, IllustrationScene, IllustrationStoryboard, StyleDecision
 from bv.illustration.style_selector import load_style_catalog
 
@@ -90,3 +96,60 @@ def test_real_ffmpeg_imports_color_master_and_derives_grayscale(tmp_path: Path) 
     assert imported.master_sha256 != imported.bw_sha256
     assert facts["width"] == 1080 and facts["height"] == 1920
     assert facts["pix_fmt"] in {"gray", "gray16be", "gray16le"}
+
+
+def test_real_ffmpeg_persists_pair_anchor_binding_before_continuation_import(
+    tmp_path: Path,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        pytest.skip("local FFmpeg is required")
+    root = tmp_path / "episode"
+    image_root = root / "media" / "illustration" / "images"
+    jobs = tuple(
+        ImageJob(
+            episode_root=root,
+            scene_id=scene_id,
+            representative=scene_id in {"S01", "S03", "S04"},
+            prompt=f"pair-{asset_id}",
+            prompt_sha256=_canonical(asset_id),
+            style_fingerprint="b" * 64,
+            character_lock_sha256="c" * 64,
+            reference_scene_ids=(scene_id,) if phase == "continuation" else (),
+            reference_image_sha256s=(),
+            phase=phase,
+            asset_id=asset_id,
+            output_master=image_root / f"{scene_id}_{phase}.png",
+        )
+        for scene_id in ("S01", "S03", "S04", "S02")
+        for phase, asset_id in (("anchor", f"{scene_id}-A"), ("continuation", f"{scene_id}-B"))
+    )
+    manifest = IllustrationManifest(
+        episode_root=root, book_id="book-demo", episode_id="E001",
+        storyboard_sha256="a" * 64, style_fingerprint="b" * 64,
+        character_lock_sha256="c" * 64, jobs=jobs,
+    )
+    source = tmp_path / "generated.png"
+    subprocess.run(
+        [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+            "color=c=#cf8b6c:s=1080x1920:d=1", "-frames:v", "1", "-y", str(source),
+        ],
+        check=True,
+    )
+
+    imported_anchor = import_image_master(
+        manifest.jobs[0], source, manifest=manifest, ffmpeg_command=ffmpeg
+    )
+    manifest = record_imported_image(manifest, imported_anchor)
+    continuation = manifest.jobs[1]
+    imported_continuation = import_image_master(
+        continuation, source, manifest=manifest, ffmpeg_command=ffmpeg
+    )
+    manifest = record_imported_image(manifest, imported_continuation)
+
+    assert continuation.anchor_sha256 == imported_anchor.master_sha256
+    assert continuation.reference_image_sha256s == (imported_anchor.master_sha256,)
+    assert imported_continuation.asset_id == "S01-B"
+    assert imported_continuation.bw_path is None and imported_continuation.bw_sha256 is None
+    assert manifest.jobs[1].status == "generated"

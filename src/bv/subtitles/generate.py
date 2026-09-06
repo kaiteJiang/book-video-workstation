@@ -86,6 +86,7 @@ def build_cues(
     *,
     audio_duration_ms: int | None = None,
     protected_terms: tuple[str, ...] = (),
+    semantic_chunks: tuple[str, ...] = (),
     min_duration_ms: int = 600,
 ) -> tuple[SubtitleCue, ...]:
     """Build timed readable cues using only Task 14 approved text and Task 16 timing."""
@@ -97,12 +98,45 @@ def build_cues(
     if not visible:
         raise SubtitleError("missing_visible_approved_text")
     protected_spans = _protected_spans(aligned.approved_text, protected_terms)
-    groups = _segment(visible, protected_spans)
-    allocated = _allocate_durations(groups, duration_ms, min_duration_ms, protected_spans)
+    groups = (
+        _groups_from_semantic_chunks(visible, semantic_chunks, protected_spans)
+        if semantic_chunks
+        else _segment(visible, protected_spans)
+    )
+    allocated = _allocate_durations(
+        groups,
+        duration_ms,
+        min_duration_ms,
+        protected_spans,
+        preserve_boundaries=bool(semantic_chunks),
+    )
     return tuple(
         SubtitleCue(index=index, start_ms=group.start_ms, end_ms=group.end_ms, text=group.text)
         for index, group in enumerate(allocated)
     )
+
+
+def _groups_from_semantic_chunks(
+    visible: list[AlignedCharacter],
+    semantic_chunks: tuple[str, ...],
+    protected_spans: tuple[tuple[int, int], ...],
+) -> list[_CueGroup]:
+    normalized = tuple(
+        "".join(character for character in chunk if not character.isspace())
+        for chunk in semantic_chunks
+        if isinstance(chunk, str) and chunk.strip()
+    )
+    source = "".join(character.character for character in visible)
+    if len(normalized) != len(semantic_chunks) or "".join(normalized) != source:
+        raise SubtitleError("semantic_chunks_text_mismatch")
+
+    groups: list[_CueGroup] = []
+    offset = 0
+    for chunk in normalized:
+        end = offset + len(chunk)
+        groups.append(_make_group(visible[offset:end], protected_spans))
+        offset = end
+    return groups
 
 
 def render_srt(cues: Sequence[SubtitleCue]) -> str:
@@ -382,6 +416,8 @@ def _display_text(units: tuple[AlignedCharacter, ...], protected_spans: tuple[tu
 def _allocate_durations(
     groups: list[_CueGroup], duration_ms: int, min_duration_ms: int,
     protected_spans: tuple[tuple[int, int], ...],
+    *,
+    preserve_boundaries: bool = False,
 ) -> list[_CueGroup]:
     values = list(groups)
     index = 0
@@ -390,6 +426,8 @@ def _allocate_durations(
         if group.end_ms - group.start_ms >= min_duration_ms:
             index += 1
             continue
+        if preserve_boundaries:
+            raise SubtitleError("insufficient_cue_duration")
         if index + 1 < len(values) and _may_merge(group, values[index + 1]):
             values[index:index + 2] = [_make_group(group.units + values[index + 1].units, protected_spans)]
             continue

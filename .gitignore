@@ -6,8 +6,10 @@ __pycache__/
 htmlcov/
 .superpowers/
 .tmp_codex_session.json
+/punk-assets/
 .env
 config.yaml
+/workspace/book-menu.json
 workspace/books/
 workspace/voices/
 workspace/logs/

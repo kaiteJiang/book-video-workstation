@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Literal, TypeVar
@@ -21,6 +23,7 @@ from bv.models.codex_cli import CodexCliModel
 from bv.models.grok_cli import GrokCliModel
 from bv.models.grok_research import GrokResearchModel
 from bv.models.prompts import load_prompt
+from bv.production.profile import load_production_profile
 from bv.state.store import StateStore
 
 from .stages import StageRunner
@@ -235,6 +238,7 @@ def build_media_runtime_bindings(
     import httpx
 
     from bv.asr.volcengine import VolcCredentials
+    from bv.books.menu import refresh_configured_book_folder_menu
     from bv.voice.audition import VoiceAuditionService
     from bv.voice.doubao import (
         DoubaoCredentials,
@@ -264,6 +268,18 @@ def build_media_runtime_bindings(
     prompt_root = Path(__file__).resolve().parents[3] / "prompts" / "illustration"
     catalog_path = (
         config.handdrawn.vendor_dir / "references" / "handdrawn-style-library.json"
+    )
+    config_sha256 = _media_runtime_config_sha256(
+        config,
+        catalog_path=catalog_path,
+        prompt_paths=(prompt_root / "style_select.md", prompt_root / "storyboard.md"),
+    )
+    stage_config_sha256s = _media_runtime_stage_config_sha256s(
+        config,
+        catalog_path=catalog_path,
+        prompt_paths=(prompt_root / "style_select.md", prompt_root / "storyboard.md"),
+        mode=mode,
+        sample_span=sample_span,
     )
     codex = CodexCliModel(
         command=config.codex.command,
@@ -338,14 +354,177 @@ def build_media_runtime_bindings(
         store=store,
         stages=stages,
         images=LocalIllustrationGateway(ffmpeg_command=config.ffmpeg.command),
+        config_sha256=config_sha256,
+        legacy_config_sha256=config_sha256,
+        stage_config_sha256_resolver=_media_runtime_stage_config_resolver(
+            stage_config_sha256s
+        ),
         configured_mode=mode,
         cover=LocalCoverGateway(),
         social_cover=LocalSocialCoverGateway(
             ffmpeg_command=config.ffmpeg.command,
         ),
         delivery=LocalDeliveryGateway(store=store),
+        restyle_catalog_path=catalog_path,
+        book_menu_refresher=lambda: refresh_configured_book_folder_menu(
+            workspace_root=config.workspace_dir,
+        ),
         voice_auditions=VoiceAuditionService(
             synthesizers=narration_synthesizers,
         ),
     )
     return MediaRuntimeBindings(service=service, stages=stages, gate_approvers={})
+
+
+def _media_runtime_config_sha256(
+    config: AppConfig,
+    *,
+    catalog_path: Path,
+    prompt_paths: tuple[Path, Path],
+) -> str:
+    try:
+        payload = {
+            "config": config.model_dump(mode="json"),
+            "catalog_sha256": hashlib.sha256(
+                catalog_path.read_bytes() if catalog_path.is_file() else b"missing-catalog"
+            ).hexdigest(),
+            "prompt_sha256s": [load_prompt(path).sha256 for path in prompt_paths],
+        }
+    except (OSError, ValueError):
+        raise RuntimeError("media_runtime_config_invalid") from None
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _media_runtime_stage_config_sha256s(
+    config: AppConfig,
+    *,
+    catalog_path: Path,
+    prompt_paths: tuple[Path, Path],
+    mode: Literal["technical_sample", "full"],
+    sample_span: tuple[int, int] | None,
+) -> dict[str, str]:
+    """Build secret-free, stage-scoped static configuration identities."""
+    try:
+        catalog = Path(catalog_path)
+        catalog_sha256 = hashlib.sha256(
+            catalog.read_bytes() if catalog.is_file() else b"missing-style-catalog"
+        ).hexdigest()
+        prompt_sha256s = tuple(load_prompt(path).sha256 for path in prompt_paths)
+        font_path = Path(config.subtitle_font_path)
+        font_sha256 = hashlib.sha256(
+            font_path.read_bytes() if font_path.is_file() else b"missing-subtitle-font"
+        ).hexdigest()
+        reference_voice_path = Path(config.voice_path)
+        reference_voice_sha256 = hashlib.sha256(
+            reference_voice_path.read_bytes()
+            if reference_voice_path.is_file()
+            else b"missing-reference-voice"
+        ).hexdigest()
+    except (OSError, ValueError):
+        raise RuntimeError("media_runtime_config_invalid") from None
+
+    style_scope = {
+        "schema": "illustration-style-config-v1",
+        "codex": config.codex.model_dump(mode="json"),
+        "catalog_sha256": catalog_sha256,
+        "style_prompt_sha256": prompt_sha256s[0],
+        "storyboard_prompt_sha256": prompt_sha256s[1],
+    }
+    payloads: dict[str, object] = {
+        "tts": {
+            "schema": "tts-config-v1",
+            "mode": mode,
+            "sample_span": sample_span,
+            "indextts2": config.indextts2.model_dump(mode="json"),
+            "doubao": config.doubao_tts.model_dump(mode="json"),
+            "reference_voice_path": str(config.voice_path),
+            "reference_voice_sha256": reference_voice_sha256,
+            "ffmpeg_command": str(config.ffmpeg.command),
+        },
+        "asr": {
+            "schema": "asr-config-v1",
+            "volc_asr": config.volc_asr.model_dump(mode="json"),
+        },
+        "subtitles": {
+            "schema": "subtitle-config-v1",
+            "font_path": str(config.subtitle_font_path),
+            "font_sha256": font_sha256,
+            "font_family": config.subtitle_font_family,
+            "width": 1080,
+            "height": 1920,
+            "break_contract": "jl-oral-linebreaks-short-max-cjk-14-v1",
+            "punctuation_free": True,
+        },
+        "select_style": style_scope,
+        "plan_illustrations": style_scope,
+        "prepare_representatives": style_scope,
+        "visual_render": {
+            "schema": "visual-render-config-v1",
+            "handdrawn": config.handdrawn.model_dump(mode="json"),
+            "ffprobe_command": str(config.ffmpeg.ffprobe_command),
+        },
+        "render": {
+            "schema": "final-render-config-v1",
+            "ffmpeg": config.ffmpeg.model_dump(mode="json"),
+        },
+        "qc": {
+            "schema": "final-qc-config-v1",
+            "ffprobe_command": str(config.ffmpeg.ffprobe_command),
+        },
+        "social_cover": {
+            "schema": "social-cover-config-v1",
+            "ffmpeg_command": str(config.ffmpeg.command),
+        },
+        "delivery": {"schema": "delivery-config-v1"},
+        "final_approval": {"schema": "final-approval-config-v1"},
+    }
+    return {
+        name: hashlib.sha256(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        for name, payload in payloads.items()
+    }
+
+
+def _media_runtime_stage_config_resolver(
+    stage_config_sha256s: Mapping[str, str],
+) -> Callable[[str, Path], str]:
+    static = dict(stage_config_sha256s)
+
+    def resolve(name: str, episode_root: Path) -> str:
+        try:
+            base = static[name]
+        except KeyError:
+            raise RuntimeError("media_stage_config_missing") from None
+        if name == "tts":
+            fields = ("duration", "tts")
+        elif name in {
+            "select_style",
+            "plan_illustrations",
+            "prepare_representatives",
+            "visual_render",
+        }:
+            fields = ("visual",)
+        elif name in {"render", "qc"}:
+            fields = ("duration", "tts", "visual")
+        elif name in {"delivery", "final_approval"}:
+            fields = ("delivery",)
+        else:
+            return base
+        profile = load_production_profile(episode_root).model_dump(mode="json")
+        payload = {field: profile[field] for field in fields}
+        encoded = json.dumps(
+            {"base": base, "profile": payload},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    return resolve

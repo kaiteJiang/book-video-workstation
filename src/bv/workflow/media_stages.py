@@ -19,7 +19,11 @@ from bv.content.scripts import ScriptPackage, SemanticLock
 from bv.core.atomic import atomic_write_json
 from bv.core.hashing import sha256_file
 from bv.illustration.assets import prepare_image_jobs
-from bv.illustration.assets import IllustrationManifest, validate_generated_image_job
+from bv.illustration.assets import (
+    IllustrationAssetError,
+    IllustrationManifest,
+    validate_generated_image_job,
+)
 from bv.illustration.contracts import (
     CharacterBible,
     CharacterLock,
@@ -50,6 +54,7 @@ from bv.subtitles.generate import (
     render_ass,
     render_srt,
 )
+from bv.subtitles.inputs import SubtitleBreakInputError, load_subtitle_break_input
 from bv.voice.indextts2 import SynthesizedVoice, synthesize_voice
 from bv.voice.audition import VoiceAuditionError, require_current_voice_profile
 from bv.voice.providers import NarrationRequest, NarrationSynthesizer
@@ -422,13 +427,19 @@ class SubtitleStage:
         try:
             aligned = AlignedScript.model_validate_json(alignment_path.read_text(encoding="utf-8"))
             voice = VoiceManifest.model_validate_json(voice_manifest_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, ValidationError):
+            break_input = load_subtitle_break_input(context.episode_root)
+            semantic_chunks = break_input.chunks
+        except (OSError, ValueError, ValidationError, SubtitleBreakInputError):
             raise MediaStageError("subtitle_input_invalid") from None
         if not self.font_path.is_file():
             raise MediaStageError("subtitle_font_invalid")
         font_hash = sha256_file(self.font_path)
         try:
-            cues = build_cues(aligned, audio_duration_ms=voice.master_duration_ms)
+            cues = build_cues(
+                aligned,
+                audio_duration_ms=voice.master_duration_ms,
+                semantic_chunks=semantic_chunks,
+            )
             srt = render_srt(cues)
             ass = render_ass(
                 cues,
@@ -459,6 +470,16 @@ class SubtitleStage:
         _atomic_text(ass_path, ass)
         atomic_write_json(cues_path, [cue.model_dump(mode="json") for cue in cues])
         atomic_write_json(manifest_path, manifest.model_dump(mode="json"))
+        inputs = {
+            "script_sha256": aligned.report.approved_sha256,
+            "audio_sha256": aligned.report.audio_sha256,
+            "subtitle_sequence_mode": break_input.sequence_mode,
+            "subtitle_breaks_presence": (
+                "present" if break_input.present else "absent"
+            ),
+        }
+        if break_input.sha256 is not None:
+            inputs["subtitle_breaks_sha256"] = break_input.sha256
         return StageOutcome(
             outputs={
                 "subtitles_srt": srt_path,
@@ -466,10 +487,7 @@ class SubtitleStage:
                 "subtitle_cues": cues_path,
                 "subtitle_manifest": manifest_path,
             },
-            inputs={
-                "script_sha256": aligned.report.approved_sha256,
-                "audio_sha256": aligned.report.audio_sha256,
-            },
+            inputs=inputs,
         )
 
 
@@ -594,6 +612,7 @@ class IllustrationPlanningStage:
                 ),
                 target_scene_count=production_profile.visual.scene_count,
                 book_title=book_title,
+                sequence_mode=production_profile.visual.sequence_mode,
             )
         except Exception as error:
             if error.__class__.__name__ == "ExternalAuthorizationError":
@@ -658,25 +677,19 @@ def build_renderer_storyboard(
     *,
     safe_area: SafeArea,
     transition: Literal["cut", "page-flip", "cross-dissolve"],
+    title_overlay: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     if manifest.storyboard_sha256 != canonical_model_sha256(storyboard):
         raise MediaStageError("illustration_dependency_mismatch")
-    jobs = {job.scene_id: job for job in manifest.jobs}
+    legacy_jobs = {job.scene_id: job for job in manifest.jobs if job.phase == "legacy"}
+    pair_jobs = {
+        (job.scene_id, job.phase): job
+        for job in manifest.jobs
+        if job.phase in {"anchor", "continuation"}
+    }
     scenes: list[dict[str, object]] = []
     for scene in storyboard.scenes:
-        job = jobs.get(scene.scene_id)
-        if job is None:
-            raise MediaStageError("illustration_job_missing")
-        try:
-            validate_generated_image_job(job)
-        except Exception:
-            raise MediaStageError("illustration_asset_invalid") from None
-        try:
-            bw = job.output_bw.relative_to(manifest.episode_root).as_posix()
-            color = job.output_master.relative_to(manifest.episode_root).as_posix()
-        except ValueError:
-            raise MediaStageError("illustration_asset_invalid") from None
-        scenes.append({
+        base = {
             "id": scene.scene_id,
             "start_ms": scene.start_ms,
             "end_ms": scene.end_ms,
@@ -684,9 +697,44 @@ def build_renderer_storyboard(
             "to_frame": scene.to_frame,
             "key_line": scene.key_line,
             "narration": scene.narration,
-            "assets": {"bw": bw, "color": color},
-        })
-    return {
+        }
+        if storyboard.sequence_mode == "color-story-pair":
+            anchor = pair_jobs.get((scene.scene_id, "anchor"))
+            continuation = pair_jobs.get((scene.scene_id, "continuation"))
+            if anchor is None or continuation is None:
+                raise MediaStageError("illustration_job_missing")
+            try:
+                validate_generated_image_job(anchor)
+                validate_generated_image_job(continuation, manifest=manifest)
+                anchor_path = anchor.output_master.relative_to(manifest.episode_root).as_posix()
+                continuation_path = continuation.output_master.relative_to(
+                    manifest.episode_root
+                ).as_posix()
+            except (IllustrationAssetError, ValueError, TypeError):
+                raise MediaStageError("illustration_asset_invalid") from None
+            scenes.append({
+                **base,
+                "sequence_mode": "color-story-pair",
+                "semantic_turn_frame": scene.semantic_turn_frame,
+                "assets": {
+                    "anchor": anchor_path,
+                    "continuation": continuation_path,
+                },
+            })
+        else:
+            job = legacy_jobs.get(scene.scene_id)
+            if job is None:
+                raise MediaStageError("illustration_job_missing")
+            try:
+                validate_generated_image_job(job)
+                if job.output_bw is None:
+                    raise ValueError
+                bw = job.output_bw.relative_to(manifest.episode_root).as_posix()
+                color = job.output_master.relative_to(manifest.episode_root).as_posix()
+            except (IllustrationAssetError, ValueError, TypeError):
+                raise MediaStageError("illustration_asset_invalid") from None
+            scenes.append({**base, "assets": {"bw": bw, "color": color}})
+    payload: dict[str, object] = {
         "project": {
             "width": 1080,
             "height": 1920,
@@ -699,9 +747,91 @@ def build_renderer_storyboard(
                 else 15 if transition == "cross-dissolve"
                 else 0
             ),
+            "show_key_line": title_overlay is None,
         },
         "safe_area": safe_area.model_dump(mode="json"),
         "scenes": scenes,
+    }
+    if storyboard.sequence_mode == "color-story-pair":
+        payload["project"]["ink_reveal_frames"] = 45
+    if title_overlay is not None:
+        title = title_overlay.get("title", "").strip()
+        author = title_overlay.get("author", "").strip()
+        if not title or not author:
+            raise MediaStageError("book_title_overlay_invalid")
+        payload["title_overlay"] = {"title": title, "author": author}
+    return payload
+
+
+def build_renderer_asset_sha256s(
+    storyboard: IllustrationStoryboard,
+    manifest: IllustrationManifest,
+) -> dict[str, str]:
+    """Bind the renderer request to the hashes recorded in validated image jobs."""
+    if manifest.storyboard_sha256 != canonical_model_sha256(storyboard):
+        raise MediaStageError("illustration_dependency_mismatch")
+    legacy_jobs = {job.scene_id: job for job in manifest.jobs if job.phase == "legacy"}
+    pair_jobs = {
+        (job.scene_id, job.phase): job
+        for job in manifest.jobs
+        if job.phase in {"anchor", "continuation"}
+    }
+    asset_sha256s: dict[str, str] = {}
+
+    def record(path: Path, expected_hash: str | None) -> None:
+        if expected_hash is None:
+            raise ValueError
+        relative_path = path.relative_to(manifest.episode_root).as_posix()
+        existing = asset_sha256s.get(relative_path)
+        if existing is not None and existing != expected_hash:
+            raise ValueError
+        asset_sha256s[relative_path] = expected_hash
+
+    for scene in storyboard.scenes:
+        try:
+            if storyboard.sequence_mode == "color-story-pair":
+                anchor = pair_jobs.get((scene.scene_id, "anchor"))
+                continuation = pair_jobs.get((scene.scene_id, "continuation"))
+                if anchor is None or continuation is None:
+                    raise MediaStageError("illustration_job_missing")
+                validate_generated_image_job(anchor)
+                validate_generated_image_job(continuation, manifest=manifest)
+                record(anchor.output_master, anchor.master_sha256)
+                record(continuation.output_master, continuation.master_sha256)
+            else:
+                job = legacy_jobs.get(scene.scene_id)
+                if job is None:
+                    raise MediaStageError("illustration_job_missing")
+                validate_generated_image_job(job)
+                if job.output_bw is None:
+                    raise ValueError
+                record(job.output_bw, job.bw_sha256)
+                record(job.output_master, job.master_sha256)
+        except MediaStageError:
+            raise
+        except (IllustrationAssetError, ValueError, TypeError):
+            raise MediaStageError("illustration_asset_invalid") from None
+    return asset_sha256s
+
+
+def _book_title_overlay(episode_root: Path) -> dict[str, str] | None:
+    book_path = episode_root.parents[1] / "book.json"
+    if not book_path.is_file():
+        return None
+    payload = json.loads(book_path.read_text(encoding="utf-8"))
+    title = payload.get("title")
+    authors = payload.get("authors")
+    if (
+        not isinstance(title, str)
+        or not title.strip()
+        or not isinstance(authors, list)
+        or not authors
+        or any(not isinstance(author, str) or not author.strip() for author in authors)
+    ):
+        raise MediaStageError("book_title_overlay_invalid")
+    return {
+        "title": title.strip(),
+        "author": "、".join(author.strip() for author in authors),
     }
 
 
@@ -735,7 +865,9 @@ class VisualRenderStage:
                 manifest,
                 safe_area=self.safe_area,
                 transition=self.transition,
+                title_overlay=_book_title_overlay(context.episode_root),
             )
+            asset_sha256s = build_renderer_asset_sha256s(storyboard, manifest)
             props_path = root / "render_storyboard.json"
             atomic_write_json(props_path, payload)
             output = context.episode_root / "media" / "render" / "picture_silent.mp4"
@@ -746,6 +878,7 @@ class VisualRenderStage:
                     storyboard_sha256=sha256_file(props_path),
                     output_path=output,
                     vendor_dir=self.vendor_dir,
+                    asset_sha256s=asset_sha256s,
                 ),
                 npm_command=self.npm_command,
                 ffprobe_command=self.ffprobe_command,
@@ -1014,6 +1147,17 @@ def _is_reparse_or_symlink(path: Path) -> bool:
         )
     except OSError:
         return True
+
+
+def _has_reparse_or_symlink_in_existing_chain(path: Path) -> bool:
+    current = Path(path)
+    while True:
+        if os.path.lexists(current) and _is_reparse_or_symlink(current):
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
 
 
 def _atomic_text(path: Path, value: str) -> None:

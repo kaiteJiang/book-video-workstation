@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
 import subprocess
 import wave
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pymupdf
 import pytest
 
 from bv.asr.volcengine import AsrResult, VolcCredentials, WordTiming
+from bv.asr.alignment import AlignedCharacter, AlignedScript, PronunciationReport
 from bv.config import IndexTTS2Config
+from bv.production.profile import ProductionProfile
 from bv.subtitles.generate import SubtitleCue, render_ass
 from bv.state.models import EpisodeState
 from bv.voice.indextts2 import SynthesizedVoice
-from bv.workflow.media_stages import AsrStage, SubtitleStage, TtsStage
+from bv.voice.processing import NarrationDuration, VoiceManifest
+from bv.workflow.media_stages import AsrStage, MediaStageError, SubtitleStage, TtsStage
 from bv.workflow.runtime import RuntimeAuthorization
 from bv.workflow.stages import StageContext
 
@@ -36,6 +41,207 @@ def _tone(path: Path, seconds: float) -> None:
         stream.writeframes(frame * round(48_000 * seconds))
 
 
+def _subtitle_stage_inputs(tmp_path: Path) -> tuple[StageContext, Path, Path]:
+    text = "这是一段批准文本。"
+    root = tmp_path / "workspace" / "books" / "book-demo" / "episodes" / "E001"
+    approved = root / "script" / "approved.txt"
+    approved.parent.mkdir(parents=True)
+    approved.write_text(text, encoding="utf-8")
+    script_sha256 = _sha(approved)
+    context = StageContext(
+        book_id="book-demo",
+        episode_id="E001",
+        episode_root=root,
+        episode_state=EpisodeState(
+            book_id="book-demo",
+            episode_id="E001",
+            status="script_approved",
+            script_hash=script_sha256,
+        ),
+    )
+    report = PronunciationReport(
+        similarity=1.0,
+        level="pass",
+        violations=(),
+        substitutions=0,
+        deletions=0,
+        insertions=0,
+        protected_terms=(),
+        approved_sha256=script_sha256,
+        audio_sha256="a" * 64,
+        asr_sha256="b" * 64,
+    )
+    aligned = AlignedScript(
+        approved_text=text,
+        characters=tuple(
+            AlignedCharacter(
+                index=index,
+                character=character,
+                start_ms=index * 100,
+                end_ms=(index + 1) * 100,
+                relation="match",
+            )
+            for index, character in enumerate(text)
+        ),
+        report=report,
+    )
+    alignment_path = root / "media" / "alignment" / "alignment.json"
+    alignment_path.parent.mkdir(parents=True)
+    alignment_path.write_text(aligned.model_dump_json(), encoding="utf-8")
+    voice = VoiceManifest(
+        voice_id="fixture",
+        script_sha256=script_sha256,
+        reference_sha256="c" * 64,
+        raw_sha256="d" * 64,
+        master_sha256="a" * 64,
+        processing_sha256="e" * 64,
+        sample_rate=48_000,
+        channels=1,
+        sample_width=2,
+        raw_duration_ms=len(text) * 100,
+        master_duration_ms=len(text) * 100,
+        qualifying_start_trim_ms=0,
+        qualifying_end_trim_ms=0,
+        duration=NarrationDuration(
+            seconds=len(text) / 10,
+            level="pass",
+            band="ideal",
+        ),
+        created_at=datetime.now(UTC),
+    )
+    voice_path = root / "media" / "voice" / "voice_master.json"
+    voice_path.parent.mkdir(parents=True)
+    voice_path.write_text(voice.model_dump_json(), encoding="utf-8")
+    font = tmp_path / "subtitle.ttf"
+    font.write_bytes(b"\x00\x01\x00\x00subtitle stage test font")
+    return context, font, approved.parent / "subtitle_breaks.txt"
+
+
+def _run_subtitle_stage(context: StageContext, font: Path) -> None:
+    SubtitleStage(font_path=font, font_family="Microsoft YaHei").run(context)
+
+
+def _write_pair_profile(context: StageContext) -> None:
+    (context.episode_root / "production_profile.json").write_text(
+        ProductionProfile.short_book_default().model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+
+def test_color_story_pair_subtitle_stage_requires_break_file(tmp_path: Path) -> None:
+    context, font, _breaks = _subtitle_stage_inputs(tmp_path)
+    _write_pair_profile(context)
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
+def test_pair_storyboard_without_profile_still_requires_break_file(
+    tmp_path: Path,
+) -> None:
+    context, font, _breaks = _subtitle_stage_inputs(tmp_path)
+    storyboard = (
+        context.episode_root
+        / "media"
+        / "illustration"
+        / "illustration_storyboard.json"
+    )
+    storyboard.parent.mkdir(parents=True)
+    storyboard.write_text(
+        '{"sequence_mode":"color-story-pair"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
+def test_color_story_pair_subtitle_stage_records_required_break_state(
+    tmp_path: Path,
+) -> None:
+    context, font, breaks = _subtitle_stage_inputs(tmp_path)
+    _write_pair_profile(context)
+    breaks.write_text("这是一段批准文本。\n", encoding="utf-8")
+
+    outcome = SubtitleStage(
+        font_path=font,
+        font_family="Microsoft YaHei",
+    ).run(context)
+
+    assert outcome.inputs["subtitle_sequence_mode"] == "color-story-pair"
+    assert outcome.inputs["subtitle_breaks_presence"] == "present"
+    assert outcome.inputs["subtitle_breaks_sha256"] == _sha(breaks)
+
+
+def test_legacy_subtitle_stage_records_missing_break_fallback(tmp_path: Path) -> None:
+    context, font, _breaks = _subtitle_stage_inputs(tmp_path)
+
+    outcome = SubtitleStage(
+        font_path=font,
+        font_family="Microsoft YaHei",
+    ).run(context)
+
+    assert outcome.inputs["subtitle_sequence_mode"] == "legacy-monochrome-reveal"
+    assert outcome.inputs["subtitle_breaks_presence"] == "absent"
+    assert "subtitle_breaks_sha256" not in outcome.inputs
+
+
+def test_corrupt_profile_cannot_be_treated_as_legacy_subtitle_fallback(
+    tmp_path: Path,
+) -> None:
+    context, font, _breaks = _subtitle_stage_inputs(tmp_path)
+    (context.episode_root / "production_profile.json").write_text(
+        '{"schema_version":1,"visual":',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
+def test_subtitle_stage_rejects_an_empty_existing_break_file(tmp_path: Path) -> None:
+    context, font, breaks = _subtitle_stage_inputs(tmp_path)
+    breaks.write_text(" \n\t\n", encoding="utf-8")
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
+def test_subtitle_stage_rejects_a_direct_break_file_symlink(tmp_path: Path) -> None:
+    context, font, breaks = _subtitle_stage_inputs(tmp_path)
+    target = tmp_path / "breaks-source.txt"
+    target.write_text("这是一段批准文本。\n", encoding="utf-8")
+    try:
+        breaks.symlink_to(target)
+    except OSError:
+        pytest.skip("symlink creation is unavailable for this test account")
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
+def test_subtitle_stage_rejects_break_file_under_a_parent_junction(tmp_path: Path) -> None:
+    if not hasattr(Path, "symlink_to"):
+        pytest.skip("Windows junction support is required")
+    context, font, breaks = _subtitle_stage_inputs(tmp_path)
+    breaks.write_text("这是一段批准文本。\n", encoding="utf-8")
+    script = breaks.parent
+    source = script.with_name("script-source")
+    script.rename(source)
+    result = subprocess.run(
+        ["cmd", "/d", "/c", "mklink", "/J", str(script), str(source)],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip("Windows junction creation is unavailable for this test account")
+
+    with pytest.raises(MediaStageError, match="subtitle_input_invalid"):
+        _run_subtitle_stage(context, font)
+
+
 def test_fake_tts_asr_with_real_audio_processing_and_subtitles(tmp_path: Path) -> None:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -44,6 +250,16 @@ def test_fake_tts_asr_with_real_audio_processing_and_subtitles(tmp_path: Path) -
     approved = root / "script" / "approved.txt"
     approved.parent.mkdir(parents=True)
     approved.write_text(TEXT, encoding="utf-8")
+    semantic_chunks = (
+        "这本书让人看见，",
+        "生活不必靠反复解释来证明。",
+        "把判断放回自己手里，",
+        "才有可能承担真正的选择。",
+    )
+    (approved.parent / "subtitle_breaks.txt").write_text(
+        "\n".join(semantic_chunks) + "\n",
+        encoding="utf-8",
+    )
     context = StageContext(
         book_id="book-demo", episode_id="E001", episode_root=root,
         episode_state=EpisodeState(
@@ -110,6 +326,30 @@ def test_fake_tts_asr_with_real_audio_processing_and_subtitles(tmp_path: Path) -
         "subtitles_srt", "subtitles_ass", "subtitle_cues", "subtitle_manifest"
     }
     assert all(path.is_file() for path in subtitle_outcome.outputs.values())
+    cue_payload = json.loads(
+        subtitle_outcome.outputs["subtitle_cues"].read_text(encoding="utf-8")
+    )
+    assert [item["text"].replace("\n", "") for item in cue_payload] == list(
+        semantic_chunks
+    )
+    assert subtitle_outcome.inputs["subtitle_breaks_sha256"] == _sha(
+        approved.parent / "subtitle_breaks.txt"
+    )
+
+    (approved.parent / "subtitle_breaks.txt").unlink()
+    fallback_outcome = SubtitleStage(
+        font_path=font,
+        font_family="Ma Shan Zheng",
+    ).run(context)
+    fallback_cues = json.loads(
+        fallback_outcome.outputs["subtitle_cues"].read_text(encoding="utf-8")
+    )
+    assert "subtitle_breaks_sha256" not in fallback_outcome.inputs
+    assert "".join(item["text"].replace("\n", "") for item in fallback_cues) == TEXT
+
+    (approved.parent / "subtitle_breaks.txt").write_text("篡改的字幕。\n", encoding="utf-8")
+    with pytest.raises(MediaStageError, match="subtitle_stage_failed"):
+        SubtitleStage(font_path=font, font_family="Ma Shan Zheng").run(context)
 
 
 def test_real_ass_renders_the_longest_supported_caption_on_one_line(tmp_path: Path) -> None:

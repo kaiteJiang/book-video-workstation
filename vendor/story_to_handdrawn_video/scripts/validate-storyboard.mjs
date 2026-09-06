@@ -5,10 +5,12 @@ import {fileURLToPath} from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const publicRoot = resolve(root, 'public');
 const minimumRevealFrames = 60;
+const storyPairInkRevealFrames = 45;
+const storyPairContinuationSideFrames = storyPairInkRevealFrames + 30 + 15;
 
 const inputFiles = () => {
   const args = process.argv.slice(2);
-  if (args.length === 2 && args[0] === '--input') return [args[1]];
+  if (args.length >= 2 && args[0] === '--input') return args.slice(1);
   if (args.length > 0 && !args.some((arg) => arg.startsWith('--'))) return args;
   return ['storyboard.9x16.fixture.json'];
 };
@@ -94,9 +96,38 @@ const validate = (file) => {
   if (!finiteInteger(project.transition_frames)) {
     errors.push('project.transition_frames must be a non-negative integer');
   }
+  if (
+    project.show_key_line !== undefined &&
+    typeof project.show_key_line !== 'boolean'
+  ) {
+    errors.push('project.show_key_line must be a boolean when present');
+  }
+  if (
+    project.ink_reveal_frames !== undefined &&
+    !finiteInteger(project.ink_reveal_frames)
+  ) {
+    errors.push('project.ink_reveal_frames must be a non-negative integer when present');
+  }
   validateSafeArea(storyboard.safe_area, errors);
+  if (
+    storyboard.title_overlay !== undefined &&
+    (
+      typeof storyboard.title_overlay?.title !== 'string' ||
+      storyboard.title_overlay.title.trim().length === 0 ||
+      typeof storyboard.title_overlay?.author !== 'string' ||
+      storyboard.title_overlay.author.trim().length === 0
+    )
+  ) {
+    errors.push('title_overlay title and author must be nonblank strings');
+  }
 
   const ids = new Set();
+  const hasStoryPairs = scenes.some(
+    (scene) => scene?.sequence_mode === 'color-story-pair',
+  );
+  if (hasStoryPairs && project.ink_reveal_frames !== storyPairInkRevealFrames) {
+    errors.push(`project.ink_reveal_frames must be ${storyPairInkRevealFrames} for story pairs`);
+  }
   let previous = null;
   for (const scene of scenes) {
     const label = scene?.id || '(unknown scene)';
@@ -133,8 +164,31 @@ const validate = (file) => {
     if (typeof scene.narration !== 'string' || !scene.narration.trim()) {
       errors.push(`${label}: narration must be nonblank`);
     }
-    assetPath(scene.assets.bw, label, 'bw', errors);
-    assetPath(scene.assets.color, label, 'color', errors);
+    const sequenceMode = scene.sequence_mode ?? 'legacy-monochrome-reveal';
+    if (!['legacy-monochrome-reveal', 'color-story-pair'].includes(sequenceMode)) {
+      errors.push(`${label}: unsupported sequence_mode`);
+    } else if (sequenceMode === 'color-story-pair') {
+      const assetKeys = Object.keys(scene.assets).sort();
+      if (assetKeys.join(',') !== 'anchor,continuation') {
+        errors.push(`${label}: story-pair assets must contain only anchor and continuation`);
+      }
+      assetPath(scene.assets.anchor, label, 'anchor', errors);
+      assetPath(scene.assets.continuation, label, 'continuation', errors);
+      if (
+        !finiteInteger(scene.semantic_turn_frame) ||
+        scene.semantic_turn_frame - scene.from_frame < 30 ||
+        scene.to_frame - scene.semantic_turn_frame < storyPairContinuationSideFrames
+      ) {
+        errors.push(`${label}: semantic_turn_frame must leave anchor, ink, and transition time`);
+      }
+    } else {
+      const assetKeys = Object.keys(scene.assets).sort();
+      if (assetKeys.join(',') !== 'bw,color') {
+        errors.push(`${label}: legacy assets must contain only bw and color`);
+      }
+      assetPath(scene.assets.bw, label, 'bw', errors);
+      assetPath(scene.assets.color, label, 'color', errors);
+    }
 
     if (previous === null) {
       if (scene.from_frame !== 0) errors.push('first scene must start at frame 0');

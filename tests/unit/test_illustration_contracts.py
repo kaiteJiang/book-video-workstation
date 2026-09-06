@@ -14,6 +14,7 @@ from bv.illustration.contracts import (
     StyleDecision,
     load_character_bible,
 )
+from bv.illustration.prompts import canonical_model_sha256
 
 
 def _scene(
@@ -67,6 +68,170 @@ def _storyboard(**updates: object) -> IllustrationStoryboard:
     }
     payload.update(updates)
     return IllustrationStoryboard.model_validate(payload)
+
+
+def _pair_scene(
+    scene_id: str,
+    from_frame: int,
+    to_frame: int,
+    *,
+    turn_offset: int = 90,
+) -> IllustrationScene:
+    turn_frame = from_frame + turn_offset
+    return IllustrationScene.model_validate(
+        {
+            **_scene(
+                scene_id,
+                from_frame,
+                to_frame,
+                start_ms=from_frame * 1000 // 30,
+                end_ms=to_frame * 1000 // 30,
+            ).model_dump(),
+            "semantic_turn_span": (0, 8),
+            "semantic_turn_ms": turn_frame * 1000 // 30,
+            "semantic_turn_frame": turn_frame,
+            "continuation_action": "母亲放慢脚步，主人公抬头看见她",
+            "continuation_prompt": "同一园路同一机位，母亲放慢脚步，主人公抬头",
+            "continuity_constraints": (
+                "same characters",
+                "same clothing",
+                "same setting",
+                "same camera direction",
+            ),
+        }
+    )
+
+
+def _pair_storyboard(
+    scene_count: int = 3,
+    *,
+    frames_per_scene: int = 180,
+    turn_offset: int = 90,
+    **updates: object,
+) -> IllustrationStoryboard:
+    scenes = tuple(
+        _pair_scene(
+            f"S{index + 1:02d}",
+            index * frames_per_scene,
+            (index + 1) * frames_per_scene,
+            turn_offset=turn_offset,
+        )
+        for index in range(scene_count)
+    )
+    payload: dict[str, object] = {
+        "sequence_mode": "color-story-pair",
+        "master_duration_ms": scene_count * frames_per_scene * 1000 // 30,
+        "total_frames": scene_count * frames_per_scene,
+        "scenes": scenes,
+    }
+    payload.update(updates)
+    return _storyboard(**payload)
+
+
+@pytest.mark.parametrize("scene_count", [3, 4])
+def test_story_pair_storyboard_accepts_complete_scene_fields(
+    scene_count: int,
+) -> None:
+    storyboard = _pair_storyboard(scene_count)
+
+    assert storyboard.scenes[0].semantic_turn_frame == 90
+
+
+def test_story_pair_storyboard_accepts_exact_anchor_and_continuation_boundaries() -> None:
+    storyboard = _pair_storyboard(
+        frames_per_scene=120,
+        turn_offset=30,
+    )
+
+    scene = storyboard.scenes[0]
+    assert scene.semantic_turn_frame - scene.from_frame == 30
+    assert scene.to_frame - scene.semantic_turn_frame == 90
+
+
+@pytest.mark.parametrize(
+    ("field", "missing_value"),
+    [
+        ("semantic_turn_span", None),
+        ("semantic_turn_ms", None),
+        ("semantic_turn_frame", None),
+        ("continuation_action", None),
+        ("continuation_prompt", None),
+        ("continuity_constraints", ()),
+    ],
+)
+def test_story_pair_storyboard_rejects_missing_scene_fields(
+    field: str, missing_value: object
+) -> None:
+    scenes = list(_pair_storyboard().scenes)
+    scenes[0] = scenes[0].model_copy(update={field: missing_value})
+
+    with pytest.raises(ValidationError, match="story_pair_fields_missing"):
+        _pair_storyboard(scenes=tuple(scenes))
+
+
+@pytest.mark.parametrize(
+    "scene_updates",
+    [
+        {"continuation_action": "   "},
+        {"continuation_prompt": "   "},
+        {"continuity_constraints": ("same characters", "   ")},
+    ],
+)
+def test_story_pair_storyboard_rejects_blank_continuation_fields(
+    scene_updates: dict[str, object],
+) -> None:
+    scenes = list(_pair_storyboard().scenes)
+    scenes[0] = scenes[0].model_copy(update=scene_updates)
+
+    with pytest.raises(ValidationError, match="story_pair_fields_missing"):
+        _pair_storyboard(scenes=tuple(scenes))
+
+
+@pytest.mark.parametrize("scene_count", [2, 5])
+def test_story_pair_storyboard_rejects_unsupported_scene_counts(
+    scene_count: int,
+) -> None:
+    with pytest.raises(ValidationError, match="story_pair_scene_count_invalid"):
+        _pair_storyboard(scene_count=scene_count)
+
+
+@pytest.mark.parametrize(
+    ("scene_updates", "error_code"),
+    [
+        (
+            {"semantic_turn_ms": 967, "semantic_turn_frame": 29},
+            "story_pair_anchor_too_short",
+        ),
+        (
+            {"semantic_turn_ms": 3_033, "semantic_turn_frame": 91},
+            "story_pair_continuation_too_short",
+        ),
+        ({"semantic_turn_span": (1, 8)}, "invalid_semantic_turn_span"),
+        ({"semantic_turn_span": (0, 16)}, "invalid_semantic_turn_span"),
+        ({"semantic_turn_ms": 6_000}, "invalid_semantic_turn_ms"),
+        ({"semantic_turn_frame": 89}, "semantic_turn_frame_mismatch"),
+    ],
+)
+def test_story_pair_storyboard_rejects_invalid_semantic_turn(
+    scene_updates: dict[str, object], error_code: str
+) -> None:
+    scenes = list(_pair_storyboard().scenes)
+    scenes[0] = scenes[0].model_copy(update=scene_updates)
+
+    with pytest.raises(ValidationError, match=error_code):
+        _pair_storyboard(scenes=tuple(scenes))
+
+
+def test_legacy_storyboard_accepts_scenes_without_story_pair_fields() -> None:
+    storyboard = _storyboard()
+
+    assert storyboard.sequence_mode == "legacy-monochrome-reveal"
+    assert canonical_model_sha256(storyboard) == (
+        "aea16439571152ca9a24073accb93d4163affdeeafc79c96ebbddd3ac0fd0885"
+    )
+    dumped = storyboard.model_dump(mode="json")
+    assert "sequence_mode" not in dumped
+    assert "semantic_turn_span" not in dumped["scenes"][0]
 
 
 def test_storyboard_requires_gapless_absolute_frames() -> None:
@@ -269,6 +434,22 @@ def test_silent_render_request_normalizes_episode_paths(tmp_path: Path) -> None:
     assert request.storyboard_path == storyboard.resolve()
     assert request.output_path == output.resolve()
     assert request.vendor_dir == vendor.resolve()
+
+
+def test_silent_render_request_binds_manifest_asset_hashes(tmp_path: Path) -> None:
+    episode_root = tmp_path / "episode"
+    request = SilentRenderRequest(
+        episode_root=episode_root,
+        storyboard_path=episode_root / "storyboard.json",
+        storyboard_sha256="a" * 64,
+        output_path=episode_root / "picture_silent.mp4",
+        vendor_dir=tmp_path / "vendor",
+        asset_sha256s={"media/illustration/images/S01_anchor.png": "b" * 64},
+    )
+
+    assert request.asset_sha256s == {
+        "media/illustration/images/S01_anchor.png": "b" * 64
+    }
 
 
 @pytest.mark.parametrize("field", ["storyboard_path", "output_path"])

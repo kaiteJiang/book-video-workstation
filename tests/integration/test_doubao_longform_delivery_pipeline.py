@@ -12,6 +12,10 @@ from pathlib import Path
 import pytest
 
 from bv.delivery.exporter import DeliveryExporter
+from bv.core.atomic import atomic_write_json
+from bv.illustration.assets import ImageJob, IllustrationManifest
+from bv.illustration.contracts import IllustrationScene, IllustrationStoryboard
+from bv.illustration.prompts import canonical_model_sha256
 from bv.production.profile import ProductionProfile, production_profile_sha256
 from bv.state.models import BookState, EpisodeState
 from bv.state.store import StateStore
@@ -111,6 +115,8 @@ class _LocalFixtureStage:
 
     def run(self, context) -> StageOutcome:
         episode = context.episode_root
+        if self.name == "prepare_representatives":
+            _write_legacy_representative_surface(episode)
         if self.name == "tts":
             wav = episode / "media" / "voice" / "voice_master.wav"
             manifest = wav.with_suffix(".json")
@@ -138,7 +144,15 @@ class _LocalFixtureStage:
                 "[Events]\nDialogue: 0,0:00:00.00,0:02:15.00,Default,,0,0,0,,活着不是向苦难低头\n",
                 encoding="utf-8",
             )
-            return StageOutcome(outputs={"subtitles_ass": ass})
+            breaks = episode / "script" / "subtitle_breaks.txt"
+            return StageOutcome(
+                outputs={"subtitles_ass": ass},
+                inputs={
+                    "subtitle_sequence_mode": "legacy-monochrome-reveal",
+                    "subtitle_breaks_presence": "present",
+                    "subtitle_breaks_sha256": _sha256(breaks),
+                },
+            )
         if self.name == "render":
             video = episode / "media" / "final" / "final.mp4"
             manifest = video.with_suffix(".render.json")
@@ -156,6 +170,87 @@ class _LocalFixtureStage:
         fixture.parent.mkdir(parents=True, exist_ok=True)
         fixture.write_text(json.dumps({"stage": self.name}), encoding="utf-8")
         return StageOutcome(outputs={self.name: fixture})
+
+
+def _write_legacy_representative_surface(root: Path) -> None:
+    scene_ids = tuple(f"S{index:02d}" for index in range(1, 16))
+    representatives = {"S01", "S08", "S15"}
+    scenes = tuple(
+        IllustrationScene(
+            scene_id=scene_id,
+            start_ms=index * 9_000,
+            end_ms=(index + 1) * 9_000,
+            from_frame=index * 270,
+            to_frame=(index + 1) * 270,
+            narration=f"旁白 {scene_id}",
+            narration_span=(index * 3, index * 3 + 3),
+            key_line="把生活还给自己",
+            visual_purpose="叙事",
+            setting="室内",
+            character_action="阅读",
+            metaphor=None,
+            composition="居中",
+            character_refs=(),
+            image_prompt=f"prompt {scene_id}",
+            negative_constraints=("禁止文字",),
+            representative_frame=scene_id in representatives,
+            asset_status="planned",
+        )
+        for index, scene_id in enumerate(scene_ids)
+    )
+    storyboard = IllustrationStoryboard(
+        book_id="book-living",
+        episode_id="E001",
+        width=1080,
+        height=1920,
+        fps=30,
+        master_duration_ms=135_000,
+        total_frames=4_050,
+        script_sha256="a" * 64,
+        audio_sha256="b" * 64,
+        subtitle_sha256="c" * 64,
+        style_decision_sha256="d" * 64,
+        character_lock_sha256="e" * 64,
+        scenes=scenes,
+    )
+    jobs = tuple(
+        ImageJob(
+            episode_root=root,
+            scene_id=scene_id,
+            representative=scene_id in representatives,
+            prompt=f"prompt {scene_id}",
+            prompt_sha256="1" * 64,
+            style_fingerprint="2" * 64,
+            character_lock_sha256="e" * 64,
+            reference_scene_ids=(),
+            reference_image_sha256s=(),
+            output_master=(
+                root / "media" / "illustration" / "images" / f"{scene_id}_master.png"
+            ),
+            output_bw=(
+                root / "media" / "illustration" / "images" / f"{scene_id}_bw.png"
+            ),
+        )
+        for scene_id in scene_ids
+    )
+    manifest = IllustrationManifest(
+        episode_root=root,
+        book_id="book-living",
+        episode_id="E001",
+        storyboard_sha256=canonical_model_sha256(storyboard),
+        style_fingerprint="2" * 64,
+        character_lock_sha256="e" * 64,
+        jobs=jobs,
+    )
+    illustration = root / "media" / "illustration"
+    atomic_write_json(
+        illustration / "illustration_storyboard.json",
+        storyboard.model_dump(mode="json"),
+    )
+    atomic_write_json(
+        illustration / "illustration_manifest.json",
+        manifest.model_dump(mode="json"),
+    )
 
 
 class _ConversationIllustrationGateway:
@@ -254,17 +349,34 @@ def test_approved_longform_episode_reaches_immutable_dated_delivery(
     episode_root = workspace / "books" / "book-living" / "episodes" / "E001"
     script = episode_root / "script" / "approved.txt"
     script.parent.mkdir(parents=True)
-    script.write_text(
+    approved_text = (
         "有些人读活着 是因为现实已经压得人喘不过气 "
         "余华没有把苦难写成奖章 也没有保证熬过去就会得到补偿 "
         "他只是让我们看见 当命运一次次拿走熟悉的人和事 "
         "一个普通人仍然可以把今天交给明天 "
         "读完以后真正留下来的 不是应该忍受一切 "
-        "而是别等失去以后 才看见眼前的人 一顿饭和一个平常晚上有多珍贵",
+        "而是别等失去以后 才看见眼前的人 一顿饭和一个平常晚上有多珍贵"
+    )
+    script.write_text(
+        approved_text,
         encoding="utf-8",
     )
+    subtitle_breaks = script.parent / "subtitle_breaks.txt"
+    subtitle_breaks.write_text(
+        "\n".join(approved_text.split()) + "\n",
+        encoding="utf-8",
+    )
+    profile_payload = ProductionProfile.living_default().model_dump(mode="json")
+    profile_payload["visual"].update(
+        sequence_mode="legacy-monochrome-reveal",
+        scene_count=15,
+    )
+    profile = ProductionProfile.model_validate(profile_payload)
+    assert profile.visual.sequence_mode == "legacy-monochrome-reveal"
+    assert profile.visual.scene_count == 15
+    assert profile.visual.representative_count == 3
     episode_root.joinpath("production_profile.json").write_text(
-        ProductionProfile.living_default().model_dump_json(indent=2),
+        profile.model_dump_json(indent=2),
         encoding="utf-8",
     )
 
@@ -299,6 +411,7 @@ def test_approved_longform_episode_reaches_immutable_dated_delivery(
         store=store,
         stages=stages,
         images=illustrations,
+        configured_mode="full",
         social_cover=LocalSocialCoverGateway(ffmpeg_command=ffmpeg),
         delivery=LocalDeliveryGateway(
             store=store,
@@ -308,6 +421,7 @@ def test_approved_longform_episode_reaches_immutable_dated_delivery(
         ),
         voice_auditions=audition,
     )
+    assert service.configured_mode == "full"
 
     with pytest.raises(MediaWorkflowError, match="voice_profile_not_approved"):
         service.prepare("book-living", "E001", mode="full")

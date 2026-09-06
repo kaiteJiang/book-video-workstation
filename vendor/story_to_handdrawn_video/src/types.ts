@@ -10,12 +10,17 @@ export type SafeArea = {
   right_reserved: number;
 };
 
-export type SceneAssets = {
+export type LegacySceneAssets = {
   bw: string;
   color: string;
 };
 
-export type SceneData = {
+export type StoryPairAssets = {
+  anchor: string;
+  continuation: string;
+};
+
+type SceneBase = {
   id: string;
   start_ms: number;
   end_ms: number;
@@ -23,8 +28,20 @@ export type SceneData = {
   to_frame: number;
   key_line: string;
   narration: string;
-  assets: SceneAssets;
 };
+
+export type LegacySceneData = SceneBase & {
+  sequence_mode?: 'legacy-monochrome-reveal';
+  assets: LegacySceneAssets;
+};
+
+export type StoryPairSceneData = SceneBase & {
+  sequence_mode: 'color-story-pair';
+  semantic_turn_frame: number;
+  assets: StoryPairAssets;
+};
+
+export type SceneData = LegacySceneData | StoryPairSceneData;
 
 export type Storyboard = {
   project: {
@@ -35,7 +52,13 @@ export type Storyboard = {
     total_frames: number;
     transition: 'cut' | 'page-flip' | 'cross-dissolve';
     transition_frames: number;
+    ink_reveal_frames?: number;
+    show_key_line?: boolean;
   };
   safe_area: SafeArea;
+  title_overlay?: {
+    title: string;
+    author: string;
+  };
   scenes: SceneData[];
 };

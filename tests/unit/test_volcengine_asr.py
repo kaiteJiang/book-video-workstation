@@ -104,6 +104,40 @@ def test_flash_request_accepts_full_length_book_video_narration(tmp_path: Path) 
     assert base64.b64decode(payload["audio"]["data"]) == master.read_bytes()
 
 
+def test_flash_request_accepts_short_book_narration_at_30_seconds(tmp_path: Path) -> None:
+    master = tmp_path / "short-book-master.wav"
+    _write_master(master, frames=48_000 * 30)
+
+    payload = json.loads(build_flash_payload(_request(master)).decode("utf-8"))
+
+    assert payload["audio"]["format"] == "wav"
+    assert base64.b64decode(payload["audio"]["data"]) == master.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("frames", "accepted"),
+    [
+        (48_000 * 30 - 1, False),
+        (48_000 * 30, True),
+        (48_000 * 150, True),
+        (48_000 * 150 + 1, False),
+    ],
+)
+def test_flash_request_uses_exact_frame_boundaries_for_master_duration(
+    tmp_path: Path,
+    frames: int,
+    accepted: bool,
+) -> None:
+    master = tmp_path / f"master-{frames}.wav"
+    _write_master(master, frames=frames)
+
+    if accepted:
+        assert build_flash_payload(_request(master))
+    else:
+        with pytest.raises(VolcengineAsrError, match="invalid_master_audio"):
+            build_flash_payload(_request(master))
+
+
 def test_flash_request_uses_exact_legacy_auth_and_rejects_bad_uuid_resource_or_master(tmp_path: Path) -> None:
     master = tmp_path / "master.wav"
     _write_master(master)

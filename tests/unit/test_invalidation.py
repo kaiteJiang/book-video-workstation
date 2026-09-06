@@ -237,6 +237,8 @@ def test_style_change_invalidates_representatives_and_all_visuals() -> None:
         completed_stages=[
             "style_decision",
             "illustration_plan",
+            "illustration_anchor",
+            "illustration_continuation",
             "representative_review",
             "illustration_images",
             "visual_render",
@@ -249,6 +251,8 @@ def test_style_change_invalidates_representatives_and_all_visuals() -> None:
 
     assert result.stale_stages == [
         "illustration_plan",
+        "illustration_anchor",
+        "illustration_continuation",
         "representative_review",
         "illustration_images",
         "visual_render",
@@ -256,6 +260,28 @@ def test_style_change_invalidates_representatives_and_all_visuals() -> None:
         "qc",
     ]
     assert result.completed_stages == ["style_decision"]
+
+
+def test_style_restyle_invalidates_actual_media_stages_but_keeps_audio_and_social_cover() -> None:
+    episode = EpisodeState(
+        book_id="book-demo",
+        episode_id="E001",
+        completed_stages=[
+            "tts", "asr", "subtitles", "social_cover", "select_style",
+            "plan_illustrations", "prepare_representatives", "representative_review",
+            "illustration_images", "visual_render", "render", "qc", "delivery",
+            "final_approval",
+        ],
+    )
+
+    result = invalidate_from(episode, "style_decision")
+
+    assert result.completed_stages == ["tts", "asr", "subtitles", "social_cover"]
+    assert result.stale_stages == [
+        "select_style", "plan_illustrations", "prepare_representatives",
+        "representative_review", "illustration_images", "visual_render", "render",
+        "qc", "delivery", "final_approval",
+    ]
 
 
 def test_visual_render_change_keeps_approved_images_but_invalidates_final() -> None:
@@ -303,4 +329,63 @@ def test_batch_prompt_change_preserves_representative_approval() -> None:
     assert result.completed_stages == ["representative_review"]
     assert result.stale_stages == [
         "illustration_images", "visual_render", "render", "qc"
+    ]
+
+
+def test_anchor_change_invalidates_its_continuation_and_pair_visual_downstream() -> None:
+    episode = EpisodeState(
+        book_id="book-demo",
+        episode_id="E001",
+        completed_stages=[
+            "illustration_anchor",
+            "illustration_continuation",
+            "representative_review",
+            "illustration_images",
+            "visual_render",
+            "render",
+            "qc",
+        ],
+    )
+
+    result = invalidate_from(episode, "illustration_anchor")
+
+    assert result.completed_stages == ["illustration_anchor"]
+    assert result.stale_stages == [
+        "illustration_continuation",
+        "representative_review",
+        "illustration_images",
+        "visual_render",
+        "render",
+        "qc",
+    ]
+
+
+def test_continuation_change_keeps_anchor_but_invalidates_pair_review_and_downstream() -> None:
+    episode = EpisodeState(
+        book_id="book-demo",
+        episode_id="E001",
+        completed_stages=[
+            "illustration_anchor",
+            "illustration_continuation",
+            "representative_review",
+            "illustration_images",
+            "visual_render",
+            "render",
+            "qc",
+            "delivery",
+            "final_approval",
+        ],
+    )
+
+    result = invalidate_from(episode, "illustration_continuation")
+
+    assert result.completed_stages == ["illustration_anchor", "illustration_continuation"]
+    assert result.stale_stages == [
+        "representative_review",
+        "illustration_images",
+        "visual_render",
+        "render",
+        "qc",
+        "delivery",
+        "final_approval",
     ]

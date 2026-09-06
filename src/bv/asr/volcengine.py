@@ -25,7 +25,7 @@ _FLASH_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recogniz
 _MAX_AUDIO_BYTES = 20 * 1_024 * 1_024
 _MAX_REQUEST_BYTES = 28 * 1_024 * 1_024
 _MAX_RESPONSE_BYTES = 4 * 1_024 * 1_024
-_MIN_MASTER_DURATION_MS = 45_000
+_MIN_MASTER_DURATION_MS = 30_000
 _MAX_MASTER_DURATION_MS = 150_000
 
 
@@ -250,9 +250,14 @@ def _read_master_snapshot(request: FlashRequest) -> tuple[bytes, int]:
                 or stream.getnframes() <= 0
             ):
                 raise VolcengineAsrError("invalid_master_audio")
-            duration_ms = round(stream.getnframes() * 1_000 / stream.getframerate())
-            if not _MIN_MASTER_DURATION_MS <= duration_ms <= _MAX_MASTER_DURATION_MS:
+            frame_count = stream.getnframes()
+            sample_rate = stream.getframerate()
+            if not (
+                frame_count * 1_000 >= _MIN_MASTER_DURATION_MS * sample_rate
+                and frame_count * 1_000 <= _MAX_MASTER_DURATION_MS * sample_rate
+            ):
                 raise VolcengineAsrError("invalid_master_audio")
+            duration_ms = round(frame_count * 1_000 / sample_rate)
             return audio_bytes, duration_ms
     except VolcengineAsrError:
         raise

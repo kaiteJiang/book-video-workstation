@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import uuid
 from collections.abc import Callable, Mapping
 from pathlib import Path, PureWindowsPath
@@ -15,6 +16,10 @@ from bv.core.process import CommandResult, run_command
 from bv.video.probe import MediaProbeFacts, probe_media
 
 from .contracts import SilentRenderRequest, SilentRenderResult
+
+
+_STORY_PAIR_INK_REVEAL_FRAMES = 45
+_STORY_PAIR_CONTINUATION_SIDE_FRAMES = _STORY_PAIR_INK_REVEAL_FRAMES + 30 + 15
 
 
 class HanddrawnRenderError(RuntimeError):
@@ -43,10 +48,12 @@ def build_handdrawn_render_argv(
     request: SilentRenderRequest,
     *,
     npm_command: str = "npm",
+    public_dir: Path | None = None,
 ) -> list[str]:
     request = _validated_request(request)
     if not isinstance(npm_command, str) or not npm_command.strip():
         raise HanddrawnRenderError("invalid_render_configuration")
+    resolved_public_dir = request.episode_root if public_dir is None else public_dir
     return [
         npm_command,
         "run",
@@ -57,7 +64,7 @@ def build_handdrawn_render_argv(
         "--output",
         str(request.output_path),
         "--public-dir",
-        str(request.episode_root),
+        str(resolved_public_dir),
     ]
 
 
@@ -75,7 +82,7 @@ def render_silent_story(
         raise HanddrawnRenderError("output_already_exists")
     if sha256_file(request.storyboard_path) != request.storyboard_sha256:
         raise HanddrawnRenderError("storyboard_hash_mismatch")
-    total_frames = _validate_storyboard_assets(request)
+    total_frames, assets = _validate_storyboard_assets(request)
     _ensure_safe_directory(request.output_path.parent)
 
     temporary = request.output_path.parent / (
@@ -87,7 +94,9 @@ def render_silent_story(
     output_hash = ""
     published = False
     completed = False
+    public_snapshot: Path | None = None
     try:
+        public_snapshot = _snapshot_public_assets(request, assets)
         try:
             result = runner(
                 build_handdrawn_render_argv(
@@ -97,6 +106,7 @@ def render_silent_story(
                         if os.name == "nt"
                         else npm_command
                     ),
+                    public_dir=public_snapshot,
                 ),
                 cwd=request.vendor_dir,
                 timeout=900,
@@ -150,6 +160,7 @@ def render_silent_story(
         return rendered
     finally:
         _remove_owned_file(temporary)
+        _remove_owned_directory(public_snapshot)
         if published and not completed:
             _remove_if_hash(request.output_path, output_hash)
 
@@ -171,7 +182,9 @@ def _validate_silent_media(
         raise HanddrawnRenderError("invalid_silent_render")
 
 
-def _validate_storyboard_assets(request: SilentRenderRequest) -> int:
+def _validate_storyboard_assets(
+    request: SilentRenderRequest,
+) -> tuple[int, tuple[tuple[Path, str], ...]]:
     try:
         payload = json.loads(request.storyboard_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
@@ -192,11 +205,38 @@ def _validate_storyboard_assets(request: SilentRenderRequest) -> int:
         or total_frames <= 0
     ):
         raise HanddrawnRenderError("invalid_storyboard")
+    ink_reveal_frames = project.get("ink_reveal_frames")
+    snapshots: dict[Path, str] = {}
     for scene in scenes:
         if not isinstance(scene, Mapping) or not isinstance(scene.get("assets"), Mapping):
             raise HanddrawnRenderError("invalid_storyboard")
         assets = scene["assets"]
-        for key in ("bw", "color"):
+        sequence_mode = scene.get("sequence_mode", "legacy-monochrome-reveal")
+        if sequence_mode == "color-story-pair":
+            semantic_turn_frame = scene.get("semantic_turn_frame")
+            from_frame = scene.get("from_frame")
+            to_frame = scene.get("to_frame")
+            if (
+                ink_reveal_frames != _STORY_PAIR_INK_REVEAL_FRAMES
+                or isinstance(semantic_turn_frame, bool)
+                or not isinstance(semantic_turn_frame, int)
+                or isinstance(from_frame, bool)
+                or not isinstance(from_frame, int)
+                or isinstance(to_frame, bool)
+                or not isinstance(to_frame, int)
+                or semantic_turn_frame - from_frame < 30
+                or to_frame - semantic_turn_frame < _STORY_PAIR_CONTINUATION_SIDE_FRAMES
+                or set(assets) != {"anchor", "continuation"}
+            ):
+                raise HanddrawnRenderError("invalid_storyboard")
+            asset_keys = ("anchor", "continuation")
+        elif sequence_mode == "legacy-monochrome-reveal":
+            if set(assets) != {"bw", "color"}:
+                raise HanddrawnRenderError("invalid_storyboard")
+            asset_keys = ("bw", "color")
+        else:
+            raise HanddrawnRenderError("invalid_storyboard")
+        for key in asset_keys:
             value = assets.get(key)
             if not isinstance(value, str) or not value:
                 raise HanddrawnRenderError("invalid_storyboard")
@@ -207,7 +247,54 @@ def _validate_storyboard_assets(request: SilentRenderRequest) -> int:
             if not asset.is_relative_to(request.episode_root):
                 raise HanddrawnRenderError("unsafe_render_path")
             _require_safe_file(asset)
-    return total_frames
+            relative_path = asset.relative_to(request.episode_root)
+            snapshots[relative_path] = ""
+    expected_hashes = request.asset_sha256s
+    if {path.as_posix() for path in snapshots} != set(expected_hashes):
+        raise HanddrawnRenderError("render_asset_hashes_invalid")
+    for relative_path in snapshots:
+        expected_hash = expected_hashes[relative_path.as_posix()]
+        source = request.episode_root / relative_path
+        if sha256_file(source) != expected_hash:
+            raise HanddrawnRenderError("render_asset_changed")
+        snapshots[relative_path] = expected_hash
+    return total_frames, tuple(snapshots.items())
+
+
+def _snapshot_public_assets(
+    request: SilentRenderRequest,
+    assets: tuple[tuple[Path, str], ...],
+) -> Path:
+    try:
+        snapshot = Path(
+            tempfile.mkdtemp(
+                prefix=".render-public-",
+                dir=request.output_path.parent,
+            )
+        )
+    except OSError:
+        raise HanddrawnRenderError("render_snapshot_failed") from None
+    try:
+        if _redirect_in_existing_chain(snapshot):
+            raise HanddrawnRenderError("unsafe_render_path")
+        for relative_path, expected_hash in assets:
+            source = request.episode_root / relative_path
+            _require_safe_file(source)
+            if sha256_file(source) != expected_hash:
+                raise HanddrawnRenderError("render_asset_changed")
+            target = snapshot / relative_path
+            _ensure_safe_directory(target.parent)
+            shutil.copyfile(source, target)
+            _require_safe_file(target)
+            if sha256_file(target) != expected_hash:
+                raise HanddrawnRenderError("render_asset_changed")
+        return snapshot
+    except HanddrawnRenderError:
+        _remove_owned_directory(snapshot)
+        raise
+    except OSError:
+        _remove_owned_directory(snapshot)
+        raise HanddrawnRenderError("render_snapshot_failed") from None
 
 
 def _require_preflight_paths(request: SilentRenderRequest) -> None:
@@ -258,6 +345,20 @@ def _remove_owned_file(path: Path) -> None:
     try:
         if path.is_file():
             path.unlink()
+    except OSError:
+        pass
+
+
+def _remove_owned_directory(path: Path | None) -> None:
+    if (
+        path is None
+        or not path.name.startswith(".render-public-")
+        or _redirect_in_existing_chain(path)
+    ):
+        return
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
     except OSError:
         pass
 

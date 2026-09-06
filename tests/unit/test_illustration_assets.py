@@ -11,6 +11,8 @@ from bv.core.process import CommandResult
 from bv.illustration.assets import (
     IllustrationAssetError,
     ImageFacts,
+    ImageJob,
+    IllustrationManifest,
     ImportedImage,
     bind_job_references,
     import_image_master,
@@ -127,6 +129,60 @@ def _storyboard(scene_count: int = 9) -> IllustrationStoryboard:
     )
 
 
+def _story_pair_storyboard() -> IllustrationStoryboard:
+    character = _character()
+    scenes = tuple(
+        IllustrationScene(
+            scene_id=f"S{index + 1:02d}",
+            start_ms=index * 5_000,
+            end_ms=(index + 1) * 5_000,
+            from_frame=index * 150,
+            to_frame=(index + 1) * 150,
+            narration=f"第{index + 1}段批准旁白内容",
+            narration_span=(index * 10, (index + 1) * 10),
+            key_line="把生活还给自己",
+            visual_purpose="把书的价值放回真实生活",
+            setting="通勤车厢",
+            character_action="主人公停下解释，打开笔记本",
+            metaphor=None,
+            composition="主体居中偏下，安全留白",
+            character_refs=("reader-01",),
+            image_prompt="普通成年读者停下解释的生活场景",
+            negative_constraints=("禁止画内文字",),
+            representative_frame=index in {0, 2, 3},
+            asset_status="planned",
+            semantic_turn_span=(index * 10, index * 10 + 2),
+            semantic_turn_ms=index * 5_000 + 1_000,
+            semantic_turn_frame=index * 150 + 30,
+            continuation_action="主人公合上笔记本，抬头看向车窗",
+            continuation_prompt="同一车厢同一机位，主人公合上笔记本并抬头",
+            continuity_constraints=(
+                "same character",
+                "same clothing",
+                "same setting",
+                "same camera direction",
+            ),
+        )
+        for index in range(4)
+    )
+    return IllustrationStoryboard(
+        book_id="book-demo",
+        episode_id="E001",
+        width=1080,
+        height=1920,
+        fps=30,
+        master_duration_ms=20_000,
+        total_frames=600,
+        script_sha256="a" * 64,
+        audio_sha256="c" * 64,
+        subtitle_sha256="d" * 64,
+        style_decision_sha256=_canonical(_decision().model_dump(mode="json")),
+        character_lock_sha256=_canonical(character.model_dump(mode="json")),
+        sequence_mode="color-story-pair",
+        scenes=scenes,
+    )
+
+
 def test_compiled_prompt_binds_exact_style_character_and_references() -> None:
     scene = _storyboard().scenes[0]
     first = compile_image_prompt(
@@ -163,6 +219,250 @@ def test_representative_jobs_generate_opening_before_middle_and_end(tmp_path: Pa
     assert representatives[2].reference_scene_ids == ("S01",)
     assert [job.scene_id for job in manifest.jobs[:3]] == ["S01", "S05", "S09"]
     assert all(job.output_master.is_relative_to(manifest.episode_root) for job in manifest.jobs)
+
+
+def test_story_pair_jobs_are_ordered_and_block_continuations_until_anchors_exist(
+    tmp_path: Path,
+) -> None:
+    manifest = prepare_image_jobs(
+        _story_pair_storyboard(),
+        _character(),
+        _style(),
+        _decision(),
+        tmp_path / "episode",
+    )
+
+    assert [(job.scene_id, job.phase) for job in manifest.jobs] == [
+        ("S01", "anchor"),
+        ("S01", "continuation"),
+        ("S03", "anchor"),
+        ("S03", "continuation"),
+        ("S04", "anchor"),
+        ("S04", "continuation"),
+        ("S02", "anchor"),
+        ("S02", "continuation"),
+    ]
+    anchor, continuation = manifest.jobs[:2]
+    assert anchor.asset_id == "S01-A"
+    assert continuation.asset_id == "S01-B"
+    assert anchor.output_master.name == "S01_anchor.png"
+    assert continuation.output_master.name == "S01_continuation.png"
+    assert anchor.output_bw is None
+    assert continuation.output_bw is None
+    with pytest.raises(IllustrationAssetError, match="anchor_image_not_ready"):
+        bind_job_references(continuation, manifest)
+
+
+def test_story_pair_continuation_import_binds_the_current_anchor_hash(
+    tmp_path: Path,
+) -> None:
+    manifest = prepare_image_jobs(
+        _story_pair_storyboard(),
+        _character(),
+        _style(),
+        _decision(),
+        tmp_path / "episode",
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CommandResult:
+        commands.append(argv)
+        Path(argv[-1]).write_bytes(b"color output")
+        return CommandResult(argv=argv, returncode=0)
+
+    inspector = lambda _path: ImageFacts(width=1080, height=1920, format="png")
+    anchor_import = import_image_master(
+        manifest.jobs[0], source, manifest=manifest, inspector=inspector,
+        ffmpeg_command="ffmpeg", runner=runner,
+    )
+    manifest = record_imported_image(manifest, anchor_import)
+    continuation = manifest.jobs[1]
+
+    assert continuation.anchor_sha256 == anchor_import.master_sha256
+    assert continuation.reference_image_sha256s == (anchor_import.master_sha256,)
+
+    continuation_import = import_image_master(
+        continuation,
+        source,
+        manifest=manifest,
+        inspector=inspector,
+        ffmpeg_command="ffmpeg",
+        runner=runner,
+    )
+    updated = record_imported_image(manifest, continuation_import)
+
+    assert continuation.anchor_sha256 == anchor_import.master_sha256
+    assert continuation.reference_image_sha256s == (anchor_import.master_sha256,)
+    assert continuation_import.bw_path is None
+    assert updated.jobs[0].master_sha256 == continuation_import.master_sha256
+    assert len(commands) == 2
+
+
+def test_story_pair_continuation_rejects_missing_or_stale_persisted_anchor_binding(
+    tmp_path: Path,
+) -> None:
+    manifest = prepare_image_jobs(
+        _story_pair_storyboard(), _character(), _style(), _decision(), tmp_path / "episode"
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"source")
+    inspector = lambda _path: ImageFacts(width=1080, height=1920, format="png")
+
+    with pytest.raises(IllustrationAssetError, match="continuation_anchor_binding_invalid"):
+        import_image_master(
+            manifest.jobs[1], source, manifest=manifest, inspector=inspector,
+            ffmpeg_command="ffmpeg",
+        )
+
+    anchor = manifest.jobs[0]
+    anchor.output_master.parent.mkdir(parents=True)
+    anchor.output_master.write_bytes(b"anchor")
+    imported_anchor = ImportedImage(
+        scene_id=anchor.scene_id,
+        asset_id=anchor.asset_id,
+        master_path=anchor.output_master,
+        master_sha256=hashlib.sha256(anchor.output_master.read_bytes()).hexdigest(),
+        width=1080,
+        height=1920,
+    )
+    manifest = record_imported_image(manifest, imported_anchor)
+    stale = manifest.jobs[1].model_copy(update={"anchor_sha256": "0" * 64})
+    stale_manifest = manifest.model_copy(update={"jobs": (manifest.jobs[0], stale, *manifest.jobs[2:])})
+
+    with pytest.raises(IllustrationAssetError, match="continuation_anchor_binding_invalid"):
+        import_image_master(
+            stale, source, manifest=stale_manifest, inspector=inspector,
+            ffmpeg_command="ffmpeg",
+        )
+    stale.output_master.write_bytes(b"forged continuation")
+    with pytest.raises(IllustrationAssetError, match="continuation_anchor_binding_invalid"):
+        record_imported_image(
+            stale_manifest,
+            ImportedImage(
+                scene_id=stale.scene_id,
+                asset_id=stale.asset_id,
+                master_path=stale.output_master,
+                master_sha256=hashlib.sha256(stale.output_master.read_bytes()).hexdigest(),
+                width=1080,
+                height=1920,
+            ),
+        )
+
+
+def test_pair_anchor_preflight_rejects_out_of_order_import_without_publishing(
+    tmp_path: Path,
+) -> None:
+    manifest = prepare_image_jobs(
+        _story_pair_storyboard(), _character(), _style(), _decision(), tmp_path / "episode"
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CommandResult:
+        commands.append(argv)
+        Path(argv[-1]).write_bytes(b"color output")
+        return CommandResult(argv=argv, returncode=0)
+
+    inspector = lambda _path: ImageFacts(width=1080, height=1920, format="png")
+    out_of_order = next(job for job in manifest.jobs if job.asset_id == "S03-A")
+    with pytest.raises(IllustrationAssetError, match="anchor_record_preflight_invalid"):
+        import_image_master(
+            out_of_order, source, manifest=manifest, inspector=inspector,
+            ffmpeg_command="ffmpeg", runner=runner,
+        )
+    assert not out_of_order.output_master.exists()
+    assert commands == []
+
+    first = manifest.jobs[0]
+    imported = import_image_master(
+        first, source, manifest=manifest, inspector=inspector,
+        ffmpeg_command="ffmpeg", runner=runner,
+    )
+    manifest = record_imported_image(manifest, imported)
+    retried = next(job for job in manifest.jobs if job.asset_id == "S03-A")
+    imported_retry = import_image_master(
+        retried, source, manifest=manifest, inspector=inspector,
+        ffmpeg_command="ffmpeg", runner=runner,
+    )
+
+    assert imported_retry.master_path == retried.output_master
+    assert retried.output_master.is_file()
+
+
+@pytest.mark.parametrize(
+    "reference_scene_ids",
+    [(), ("S02", "S01"), ("S01", "S01")],
+)
+def test_pair_anchor_preflight_rejects_invalid_continuation_self_reference_before_publish(
+    tmp_path: Path,
+    reference_scene_ids: tuple[str, ...],
+) -> None:
+    manifest = prepare_image_jobs(
+        _story_pair_storyboard(), _character(), _style(), _decision(), tmp_path / "episode"
+    )
+    anchor, continuation = manifest.jobs[:2]
+    damaged = manifest.model_copy(
+        update={
+            "jobs": (
+                anchor,
+                continuation.model_copy(update={"reference_scene_ids": reference_scene_ids}),
+                *manifest.jobs[2:],
+            )
+        }
+    )
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"source")
+    commands: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CommandResult:
+        commands.append(argv)
+        Path(argv[-1]).write_bytes(b"color output")
+        return CommandResult(argv=argv, returncode=0)
+
+    inspector = lambda _path: ImageFacts(width=1080, height=1920, format="png")
+    with pytest.raises(IllustrationAssetError, match="anchor_record_preflight_invalid"):
+        import_image_master(
+            anchor, source, manifest=damaged, inspector=inspector,
+            ffmpeg_command="ffmpeg", runner=runner,
+        )
+    assert not anchor.output_master.exists()
+    assert commands == []
+
+    imported = import_image_master(
+        anchor, source, manifest=manifest, inspector=inspector,
+        ffmpeg_command="ffmpeg", runner=runner,
+    )
+    assert imported.master_path.is_file()
+
+
+def test_legacy_image_job_and_manifest_json_shape_and_hash_are_stable(tmp_path: Path) -> None:
+    manifest = prepare_image_jobs(
+        _storyboard(3), _character(), _style(), _decision(), tmp_path / "episode"
+    )
+    job = manifest.jobs[0]
+
+    expected_job = {
+        "episode_root": str(job.episode_root), "scene_id": job.scene_id,
+        "representative": job.representative, "prompt": job.prompt,
+        "prompt_sha256": job.prompt_sha256, "style_fingerprint": job.style_fingerprint,
+        "character_lock_sha256": job.character_lock_sha256,
+        "reference_scene_ids": [], "reference_image_sha256s": [],
+        "output_master": str(job.output_master), "output_bw": str(job.output_bw),
+        "master_sha256": None, "bw_sha256": None, "attempts": 0, "status": "planned",
+    }
+
+    assert job.model_dump(mode="json") == expected_job
+    assert json.loads(job.model_dump_json()) == expected_job
+    manifest_json = manifest.model_dump(mode="json")
+    assert all(
+        "phase" not in item and "asset_id" not in item and "anchor_sha256" not in item
+        for item in manifest_json["jobs"]
+    )
+    assert json.loads(manifest.model_dump_json()) == manifest_json
+    assert _canonical(manifest_json) == _canonical(json.loads(manifest.model_dump_json()))
 
 
 def test_prepare_rejects_stale_character_or_style_binding(tmp_path: Path) -> None:

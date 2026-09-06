@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import unicodedata
@@ -22,6 +23,7 @@ from bv.models.contracts import (
     is_redirected,
 )
 from bv.models.prompts import compose_source_prompt
+from bv.production.profile import VisualSequenceMode
 from bv.subtitles.generate import SubtitleCue
 
 from .contracts import (
@@ -108,6 +110,25 @@ class _SceneDraft(_PlanModel):
     character_refs: tuple[str, ...]
     image_prompt: str
     negative_constraints: tuple[str, ...]
+    semantic_turn_offset: int | None
+    continuation_action: str | None
+    continuation_prompt: str | None
+    continuity_constraints: tuple[str, ...] | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_scene(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        migrated = dict(value)
+        for field in (
+            "semantic_turn_offset",
+            "continuation_action",
+            "continuation_prompt",
+            "continuity_constraints",
+        ):
+            migrated.setdefault(field, None)
+        return migrated
 
 
 class _VisualPlanDraft(_PlanModel):
@@ -262,9 +283,16 @@ def _profile_scene_count(
     return min(max(target_count, minimum_count), maximum_count)
 
 
+def _has_source_protagonist(approved_text: str) -> bool:
+    return "福贵" in approved_text or re.search(
+        r"我叫[\u3400-\u4dbf\u4e00-\u9fff·]{2,8}[。！？!?]",
+        approved_text,
+    ) is not None
+
+
 def _allowed_character_ids(approved_text: str) -> tuple[str, ...]:
     identifiers = ["reader-01"]
-    if "福贵" in approved_text:
+    if _has_source_protagonist(approved_text):
         identifiers.append("source-protagonist")
     if any(
         name in approved_text
@@ -286,9 +314,13 @@ def _visual_allocation(allowed_character_ids: tuple[str, ...]) -> dict[str, str]
     }
 
 
-def _representative_indexes(scenes: Sequence[_SceneDraft]) -> set[int]:
+def _representative_indexes(
+    scenes: Sequence[_SceneDraft], *, sequence_mode: VisualSequenceMode
+) -> set[int]:
     count = len(scenes)
     anchors = (0, count // 2, count - 1)
+    if sequence_mode == "color-story-pair":
+        return set(anchors)
     protagonist_indexes = tuple(
         index
         for index, scene in enumerate(scenes)
@@ -325,6 +357,7 @@ def plan_illustrations(
     seconds_per_scene_max: float | None = None,
     target_scene_count: int | None = None,
     book_title: str | None = None,
+    sequence_mode: VisualSequenceMode = "legacy-monochrome-reveal",
 ) -> tuple[CharacterBible, IllustrationStoryboard]:
     _validate_sources(
         approved_text=approved_text,
@@ -356,7 +389,7 @@ def plan_illustrations(
         raise IllustrationPlanError("unsafe_request_directory")
 
     allowed_character_ids = _allowed_character_ids(approved_text)
-    payload = {
+    payload: dict[str, object] = {
         "book_title": (book_title or book_id).strip(),
         "approved_text": approved_text,
         "semantic_lock": semantic_lock.model_dump(mode="json"),
@@ -372,6 +405,8 @@ def plan_illustrations(
             for window, (text, span) in zip(windows, narration, strict=True)
         ],
     }
+    if sequence_mode == "color-story-pair":
+        payload["sequence_mode"] = sequence_mode
     prompt = compose_source_prompt(
         prompt_asset.text,
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
@@ -395,6 +430,7 @@ def plan_illustrations(
         style_decision=style_decision,
         windows=windows,
         narration=narration,
+        sequence_mode=sequence_mode,
     )
 
 
@@ -410,6 +446,7 @@ def _validate_visual_plan(
     style_decision: StyleDecision,
     windows: tuple[SceneWindow, ...],
     narration: tuple[tuple[str, tuple[int, int]], ...],
+    sequence_mode: VisualSequenceMode,
 ) -> tuple[CharacterBible, IllustrationStoryboard]:
     if len(draft.scenes) != len(windows) or any(
         scene.scene_id != window.scene_id
@@ -418,6 +455,17 @@ def _validate_visual_plan(
         raise IllustrationPlanError("visual_plan_window_mismatch")
     if _unsafe_model_output(draft):
         raise IllustrationPlanError("unsafe_visual_plan")
+    if sequence_mode == "color-story-pair" and (
+        len(windows) not in {3, 4}
+        or any(
+            scene.semantic_turn_offset is None
+            or scene.continuation_action is None
+            or scene.continuation_prompt is None
+            or scene.continuity_constraints is None
+            for scene in draft.scenes
+        )
+    ):
+        raise IllustrationPlanError("invalid_visual_plan")
     character_values = tuple(
         character.model_dump(mode="python") for character in draft.characters
     )
@@ -456,7 +504,7 @@ def _validate_visual_plan(
     else:
         if (
             "source-protagonist" in allowed_character_refs
-            and "福贵" not in approved_text
+            and not _has_source_protagonist(approved_text)
         ):
             raise IllustrationPlanError("source_character_not_grounded")
         if (
@@ -499,7 +547,9 @@ def _validate_visual_plan(
         if not 0.5 <= reader_ratio <= 0.7 and not deviation:
             raise IllustrationPlanError("narrative_ratio_unexplained")
 
-    representative_indexes = _representative_indexes(draft.scenes)
+    representative_indexes = _representative_indexes(
+        draft.scenes, sequence_mode=sequence_mode
+    )
     scenes: list[IllustrationScene] = []
     for index, (scene, window, (scene_narration, span)) in enumerate(
         zip(draft.scenes, windows, narration, strict=True)
@@ -509,6 +559,25 @@ def _validate_visual_plan(
         if _visible(scene.key_line) == _visible(scene_narration):
             raise IllustrationPlanError("invalid_key_line")
         negative = tuple(dict.fromkeys((*scene.negative_constraints, *_FIXED_NEGATIVE_CONSTRAINTS)))
+        pair_fields: dict[str, object] = {}
+        if sequence_mode == "color-story-pair":
+            assert scene.semantic_turn_offset is not None
+            assert scene.continuation_action is not None
+            assert scene.continuation_prompt is not None
+            assert scene.continuity_constraints is not None
+            semantic_turn_span, semantic_turn_ms, semantic_turn_frame = resolve_semantic_turn(
+                scene_span=span,
+                semantic_turn_offset=scene.semantic_turn_offset,
+                aligned_script=aligned_script,
+            )
+            pair_fields = {
+                "semantic_turn_span": semantic_turn_span,
+                "semantic_turn_ms": semantic_turn_ms,
+                "semantic_turn_frame": semantic_turn_frame,
+                "continuation_action": scene.continuation_action,
+                "continuation_prompt": scene.continuation_prompt,
+                "continuity_constraints": scene.continuity_constraints,
+            }
         try:
             scenes.append(
                 IllustrationScene(
@@ -530,6 +599,7 @@ def _validate_visual_plan(
                     negative_constraints=negative,
                     representative_frame=index in representative_indexes,
                     asset_status="planned",
+                    **pair_fields,
                 )
             )
         except ValidationError:
@@ -558,11 +628,40 @@ def _validate_visual_plan(
             character_lock_sha256=character_sha,
             character_bible_sha256=character_sha,
             narrative_deviation_reason=deviation,
+            sequence_mode=sequence_mode,
             scenes=tuple(scenes),
         )
     except ValidationError:
         raise IllustrationPlanError("invalid_visual_plan") from None
     return character_bible, storyboard
+
+
+def resolve_semantic_turn(
+    *,
+    scene_span: tuple[int, int],
+    semantic_turn_offset: int,
+    aligned_script: AlignedScript,
+) -> tuple[tuple[int, int], int, int]:
+    start, end = scene_span
+    absolute_turn_index = start + semantic_turn_offset
+    if absolute_turn_index <= start or absolute_turn_index >= end:
+        raise IllustrationPlanError("semantic_turn_outside_scene")
+    timed = next(
+        (
+            character
+            for character in aligned_script.characters[absolute_turn_index:end]
+            if character.start_ms is not None
+        ),
+        None,
+    )
+    if timed is None:
+        raise IllustrationPlanError("semantic_turn_alignment_missing")
+    assert timed.start_ms is not None
+    return (
+        (start, absolute_turn_index),
+        timed.start_ms,
+        round(timed.start_ms * 30 / 1000),
+    )
 
 
 def _narration_windows(

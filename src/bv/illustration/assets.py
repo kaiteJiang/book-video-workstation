@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import tempfile
@@ -64,12 +65,29 @@ class ImageJob(_AssetModel):
     character_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     reference_scene_ids: tuple[str, ...]
     reference_image_sha256s: tuple[str, ...]
+    phase: Literal["legacy", "anchor", "continuation"] = "legacy"
+    asset_id: str | None = None
+    anchor_sha256: str | None = None
     output_master: Path
-    output_bw: Path
+    output_bw: Path | None = None
     master_sha256: str | None = None
     bw_sha256: str | None = None
     attempts: int = Field(default=0, ge=0)
     status: Literal["planned", "generated", "approved"] = "planned"
+
+    def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
+        payload = super().model_dump(*args, **kwargs)
+        if self.phase == "legacy":
+            for field in ("phase", "asset_id", "anchor_sha256"):
+                payload.pop(field, None)
+        return payload
+
+    def model_dump_json(self, *args: object, **kwargs: object) -> str:
+        payload = json.loads(super().model_dump_json(*args, **kwargs))
+        if self.phase == "legacy":
+            for field in ("phase", "asset_id", "anchor_sha256"):
+                payload.pop(field, None)
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 class IllustrationManifest(_AssetModel):
@@ -81,13 +99,27 @@ class IllustrationManifest(_AssetModel):
     character_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     jobs: tuple[ImageJob, ...]
 
+    def model_dump(self, *args: object, **kwargs: object) -> dict[str, object]:
+        payload = super().model_dump(*args, **kwargs)
+        for job, serialized in zip(self.jobs, payload["jobs"], strict=True):
+            if job.phase == "legacy":
+                for field in ("phase", "asset_id", "anchor_sha256"):
+                    serialized.pop(field, None)
+        return payload
+
+    def model_dump_json(self, *args: object, **kwargs: object) -> str:
+        return json.dumps(
+            self.model_dump(mode="json"), ensure_ascii=False, separators=(",", ":")
+        )
+
 
 class ImportedImage(_AssetModel):
     scene_id: str
+    asset_id: str | None = None
     master_path: Path
     master_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    bw_path: Path
-    bw_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bw_path: Path | None = None
+    bw_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     width: Literal[1080]
     height: Literal[1920]
 
@@ -149,32 +181,69 @@ def prepare_image_jobs(
             and scene.scene_id != opening_id
         ):
             reference_scene_ids = (opening_id,)
-        prompt = compile_image_prompt(
-            scene,
-            style=style,
-            character_lock=character_lock,
-            reference_scene_ids=reference_scene_ids,
-        )
         image_root = root / "media" / "illustration" / "images"
-        compiled.append(
-            ImageJob(
-                episode_root=root,
-                scene_id=scene.scene_id,
-                representative=scene.representative_frame,
-                prompt=prompt.prompt,
-                prompt_sha256=prompt.prompt_sha256,
-                style_fingerprint=prompt.style_fingerprint,
-                character_lock_sha256=prompt.character_lock_sha256,
+        if storyboard.sequence_mode == "color-story-pair":
+            for phase, asset_id, phase_references in (
+                ("anchor", f"{scene.scene_id}-A", reference_scene_ids),
+                (
+                    "continuation",
+                    f"{scene.scene_id}-B",
+                    (scene.scene_id, *tuple(item for item in reference_scene_ids if item != scene.scene_id)),
+                ),
+            ):
+                prompt = compile_image_prompt(
+                    scene,
+                    style=style,
+                    character_lock=character_lock,
+                    reference_scene_ids=phase_references,
+                    phase=phase,
+                )
+                compiled.append(
+                    ImageJob(
+                        episode_root=root,
+                        scene_id=scene.scene_id,
+                        representative=scene.representative_frame,
+                        prompt=prompt.prompt,
+                        prompt_sha256=prompt.prompt_sha256,
+                        style_fingerprint=prompt.style_fingerprint,
+                        character_lock_sha256=prompt.character_lock_sha256,
+                        reference_scene_ids=phase_references,
+                        reference_image_sha256s=(),
+                        phase=phase,
+                        asset_id=asset_id,
+                        output_master=image_root / f"{scene.scene_id}_{phase}.png",
+                    )
+                )
+        else:
+            prompt = compile_image_prompt(
+                scene,
+                style=style,
+                character_lock=character_lock,
                 reference_scene_ids=reference_scene_ids,
-                reference_image_sha256s=(),
-                output_master=image_root / f"{scene.scene_id}_master.png",
-                output_bw=image_root / f"{scene.scene_id}_bw.png",
             )
-        )
+            compiled.append(
+                ImageJob(
+                    episode_root=root,
+                    scene_id=scene.scene_id,
+                    representative=scene.representative_frame,
+                    prompt=prompt.prompt,
+                    prompt_sha256=prompt.prompt_sha256,
+                    style_fingerprint=prompt.style_fingerprint,
+                    character_lock_sha256=prompt.character_lock_sha256,
+                    reference_scene_ids=reference_scene_ids,
+                    reference_image_sha256s=(),
+                    output_master=image_root / f"{scene.scene_id}_master.png",
+                    output_bw=image_root / f"{scene.scene_id}_bw.png",
+                )
+            )
     ordered = tuple(
         sorted(
             compiled,
-            key=lambda job: (not job.representative, _scene_number(job.scene_id)),
+            key=lambda job: (
+                not job.representative,
+                _scene_number(job.scene_id),
+                {"anchor": 0, "continuation": 1, "legacy": 0}[job.phase],
+            ),
         )
     )
     return IllustrationManifest(
@@ -188,10 +257,11 @@ def prepare_image_jobs(
     )
 
 
-def import_image_master(
+def import_image_asset(
     job: ImageJob,
     source_path: Path,
     *,
+    manifest: IllustrationManifest | None = None,
     inspector: Callable[[Path], ImageFacts] | None = None,
     ffmpeg_command: str | Path,
     runner: Callable[..., CommandResult] = run_command,
@@ -200,15 +270,26 @@ def import_image_master(
         job = ImageJob.model_validate(job)
     except ValidationError:
         raise IllustrationAssetError("invalid_image_job") from None
+    if job.phase in {"anchor", "continuation"}:
+        if manifest is None:
+            raise IllustrationAssetError("continuation_anchor_binding_invalid")
+        if job.phase == "continuation":
+            _validate_continuation_binding(job, manifest)
+        else:
+            _validate_anchor_record_preflight(job, manifest)
     _validate_job_paths(job)
     source = Path(source_path)
     _require_safe_source(source)
-    if job.output_master.exists() or job.output_bw.exists():
+    if job.output_master.exists() or (job.output_bw is not None and job.output_bw.exists()):
         raise IllustrationAssetError("image_output_exists")
     _ensure_safe_directory(job.output_master.parent)
     snapshot: Path | None = None
     master_temp = job.output_master.parent / f".{job.scene_id}.{uuid.uuid4().hex}.master.png"
-    bw_temp = job.output_bw.parent / f".{job.scene_id}.{uuid.uuid4().hex}.bw.png"
+    bw_temp = (
+        job.output_master.parent / f".{job.scene_id}.{uuid.uuid4().hex}.bw.png"
+        if job.phase == "legacy"
+        else None
+    )
     published: list[tuple[Path, str]] = []
     inspect = inspector or inspect_image
     try:
@@ -235,28 +316,31 @@ def import_image_master(
             ],
         )
         _validate_derived(master_temp, inspect, expected_format="png")
-        _run_ffmpeg(
-            runner,
-            [
-                str(ffmpeg_command), "-hide_banner", "-loglevel", "error", "-nostdin",
-                "-i", str(master_temp), "-map_metadata", "-1", "-frames:v", "1",
-                "-vf", "format=gray", "-compression_level", "6", "-y", str(bw_temp),
-            ],
-        )
-        _validate_derived(bw_temp, inspect, expected_format="png")
+        if bw_temp is not None:
+            _run_ffmpeg(
+                runner,
+                [
+                    str(ffmpeg_command), "-hide_banner", "-loglevel", "error", "-nostdin",
+                    "-i", str(master_temp), "-map_metadata", "-1", "-frames:v", "1",
+                    "-vf", "format=gray", "-compression_level", "6", "-y", str(bw_temp),
+                ],
+            )
+            _validate_derived(bw_temp, inspect, expected_format="png")
         if sha256_file(source) != source_hash or _redirect_in_existing_chain(source):
             raise IllustrationAssetError("image_source_changed")
 
         master_hash = sha256_file(master_temp)
-        bw_hash = sha256_file(bw_temp)
-        if master_hash == bw_hash:
+        bw_hash = sha256_file(bw_temp) if bw_temp is not None else None
+        if bw_hash is not None and master_hash == bw_hash:
             raise IllustrationAssetError("grayscale_derivation_failed")
         _publish_new(master_temp, job.output_master, master_hash)
         published.append((job.output_master, master_hash))
-        _publish_new(bw_temp, job.output_bw, bw_hash)
-        published.append((job.output_bw, bw_hash))
+        if bw_temp is not None and job.output_bw is not None and bw_hash is not None:
+            _publish_new(bw_temp, job.output_bw, bw_hash)
+            published.append((job.output_bw, bw_hash))
         return ImportedImage(
             scene_id=job.scene_id,
+            asset_id=job.asset_id,
             master_path=job.output_master,
             master_sha256=master_hash,
             bw_path=job.output_bw,
@@ -278,6 +362,26 @@ def import_image_master(
         _remove_owned(bw_temp)
 
 
+def import_image_master(
+    job: ImageJob,
+    source_path: Path,
+    *,
+    manifest: IllustrationManifest | None = None,
+    inspector: Callable[[Path], ImageFacts] | None = None,
+    ffmpeg_command: str | Path,
+    runner: Callable[..., CommandResult] = run_command,
+) -> ImportedImage:
+    """Backward-compatible entry point for legacy master-plus-grayscale imports."""
+    return import_image_asset(
+        job,
+        source_path,
+        manifest=manifest,
+        inspector=inspector,
+        ffmpeg_command=ffmpeg_command,
+        runner=runner,
+    )
+
+
 def record_imported_image(
     manifest: IllustrationManifest,
     imported: ImportedImage,
@@ -287,20 +391,31 @@ def record_imported_image(
         imported = ImportedImage.model_validate(imported)
     except ValidationError:
         raise IllustrationAssetError("invalid_imported_image") from None
-    matches = [job for job in manifest.jobs if job.scene_id == imported.scene_id]
+    matches = [
+        job
+        for job in manifest.jobs
+        if job.scene_id == imported.scene_id and job.asset_id == imported.asset_id
+    ]
     if len(matches) != 1:
         raise IllustrationAssetError("image_job_not_found")
     target = matches[0]
+    if target.phase == "continuation":
+        _validate_continuation_binding(target, manifest)
+    elif target.phase == "anchor":
+        _validate_anchor_record_preflight(target, manifest)
     _validate_job_paths(target)
     if (
         imported.master_path != target.output_master
         or imported.bw_path != target.output_bw
         or not target.output_master.is_file()
-        or not target.output_bw.is_file()
+        or (target.output_bw is not None and not target.output_bw.is_file())
         or _redirect_in_existing_chain(target.output_master)
-        or _redirect_in_existing_chain(target.output_bw)
+        or (target.output_bw is not None and _redirect_in_existing_chain(target.output_bw))
         or sha256_file(target.output_master) != imported.master_sha256
-        or sha256_file(target.output_bw) != imported.bw_sha256
+        or (
+            target.output_bw is not None
+            and (imported.bw_sha256 is None or sha256_file(target.output_bw) != imported.bw_sha256)
+        )
     ):
         raise IllustrationAssetError("imported_image_hash_mismatch")
     jobs = tuple(
@@ -312,11 +427,32 @@ def record_imported_image(
                 "attempts": job.attempts + 1,
             }
         )
-        if job.scene_id == imported.scene_id
+        if job.scene_id == imported.scene_id and job.asset_id == imported.asset_id
         else job
         for job in manifest.jobs
     )
-    return manifest.model_copy(update={"jobs": jobs})
+    updated = manifest.model_copy(update={"jobs": jobs})
+    if target.phase != "anchor":
+        return updated
+    continuations = [
+        job
+        for job in updated.jobs
+        if job.scene_id == target.scene_id and job.phase == "continuation"
+    ]
+    if len(continuations) != 1:
+        return updated
+    continuation = continuations[0]
+    if continuation.anchor_sha256 is not None or continuation.reference_image_sha256s:
+        return updated
+    bound = bind_job_references(continuation, updated)
+    return updated.model_copy(
+        update={
+            "jobs": tuple(
+                bound if job.asset_id == bound.asset_id else job
+                for job in updated.jobs
+            )
+        }
+    )
 
 
 def bind_job_references(
@@ -335,9 +471,32 @@ def bind_job_references(
     ):
         raise IllustrationAssetError("illustration_dependency_mismatch")
     _validate_job_paths(job)
+    anchor: ImageJob | None = None
+    if job.phase == "continuation":
+        matches = [
+            item for item in manifest.jobs
+            if item.scene_id == job.scene_id and item.phase == "anchor"
+        ]
+        if len(matches) != 1:
+            raise IllustrationAssetError("anchor_image_not_ready")
+        anchor = matches[0]
+        try:
+            validate_generated_image_job(anchor)
+        except IllustrationAssetError:
+            raise IllustrationAssetError("anchor_image_not_ready") from None
+        if job.anchor_sha256 is not None and job.anchor_sha256 != anchor.master_sha256:
+            raise IllustrationAssetError("anchor_image_stale")
     hashes: list[str] = []
     for scene_id in job.reference_scene_ids:
-        matches = [item for item in manifest.jobs if item.scene_id == scene_id]
+        matches = [
+            item
+            for item in manifest.jobs
+            if item.scene_id == scene_id
+            and (
+                (job.phase == "continuation" and scene_id == job.scene_id and item.phase == "anchor")
+                or (scene_id != job.scene_id and item.phase in {"anchor", "legacy"})
+            )
+        ]
         if len(matches) != 1:
             raise IllustrationAssetError("reference_image_not_ready")
         reference = matches[0]
@@ -350,6 +509,7 @@ def bind_job_references(
     return job.model_copy(
         update={
             "reference_image_sha256s": bound_hashes,
+            "anchor_sha256": anchor.master_sha256 if anchor is not None else job.anchor_sha256,
             "prompt_sha256": image_prompt_identity_sha256(
                 prompt=job.prompt,
                 style_fingerprint=job.style_fingerprint,
@@ -360,24 +520,157 @@ def bind_job_references(
     )
 
 
-def validate_generated_image_job(job: ImageJob) -> None:
+def validate_generated_image_job(
+    job: ImageJob,
+    *,
+    manifest: IllustrationManifest | None = None,
+) -> None:
     try:
         job = ImageJob.model_validate(job)
     except ValidationError:
         raise IllustrationAssetError("invalid_image_job") from None
     _validate_job_paths(job)
+    if job.phase == "continuation":
+        if manifest is None:
+            raise IllustrationAssetError("continuation_anchor_binding_invalid")
+        _validate_continuation_binding(job, manifest)
     if (
         job.status not in {"generated", "approved"}
         or job.master_sha256 is None
-        or job.bw_sha256 is None
+        or (job.phase == "legacy" and job.bw_sha256 is None)
         or not job.output_master.is_file()
-        or not job.output_bw.is_file()
+        or (job.phase == "legacy" and (job.output_bw is None or not job.output_bw.is_file()))
         or _redirect_in_existing_chain(job.output_master)
-        or _redirect_in_existing_chain(job.output_bw)
+        or (job.output_bw is not None and _redirect_in_existing_chain(job.output_bw))
         or sha256_file(job.output_master) != job.master_sha256
-        or sha256_file(job.output_bw) != job.bw_sha256
+        or (
+            job.phase == "legacy"
+            and (job.output_bw is None or job.bw_sha256 is None or sha256_file(job.output_bw) != job.bw_sha256)
+        )
     ):
         raise IllustrationAssetError("recorded_image_invalid")
+
+
+def _validate_continuation_binding(
+    job: ImageJob,
+    manifest: IllustrationManifest,
+) -> None:
+    try:
+        manifest = IllustrationManifest.model_validate(manifest)
+    except ValidationError:
+        raise IllustrationAssetError("continuation_anchor_binding_invalid") from None
+    if job.phase != "continuation" or job.asset_id != f"{job.scene_id}-B":
+        raise IllustrationAssetError("continuation_anchor_binding_invalid")
+    anchors = [
+        item
+        for item in manifest.jobs
+        if (
+            item.scene_id == job.scene_id
+            and item.phase == "anchor"
+            and item.asset_id == f"{job.scene_id}-A"
+        )
+    ]
+    stored = [
+        item
+        for item in manifest.jobs
+        if item.scene_id == job.scene_id and item.phase == "continuation" and item.asset_id == job.asset_id
+    ]
+    if len(anchors) != 1 or len(stored) != 1:
+        raise IllustrationAssetError("continuation_anchor_binding_invalid")
+    anchor = anchors[0]
+    try:
+        validate_generated_image_job(anchor)
+    except IllustrationAssetError:
+        raise IllustrationAssetError("continuation_anchor_binding_invalid") from None
+    persisted = stored[0]
+    _validate_continuation_binding_values(job, persisted, anchor.master_sha256)
+
+
+def _validate_continuation_binding_values(
+    job: ImageJob,
+    persisted: ImageJob,
+    anchor_sha256: str,
+) -> None:
+    if (
+        job.anchor_sha256 != anchor_sha256
+        or not job.reference_image_sha256s
+        or job.reference_image_sha256s[0] != anchor_sha256
+        or persisted.anchor_sha256 != job.anchor_sha256
+        or persisted.reference_image_sha256s != job.reference_image_sha256s
+        or persisted.prompt_sha256 != job.prompt_sha256
+    ):
+        raise IllustrationAssetError("continuation_anchor_binding_invalid")
+
+
+def _validate_anchor_record_preflight(
+    job: ImageJob,
+    manifest: IllustrationManifest,
+) -> None:
+    """Reject anchor imports whose required continuation binding cannot persist."""
+    try:
+        manifest = IllustrationManifest.model_validate(manifest)
+    except ValidationError:
+        raise IllustrationAssetError("anchor_record_preflight_invalid") from None
+    if job.phase != "anchor" or job.asset_id != f"{job.scene_id}-A":
+        raise IllustrationAssetError("anchor_record_preflight_invalid")
+    continuations = [
+        item
+        for item in manifest.jobs
+        if (
+            item.scene_id == job.scene_id
+            and item.phase == "continuation"
+            and item.asset_id == f"{job.scene_id}-B"
+        )
+    ]
+    if len(continuations) != 1:
+        raise IllustrationAssetError("anchor_record_preflight_invalid")
+    continuation = continuations[0]
+    if (
+        continuation.episode_root != manifest.episode_root
+        or continuation.style_fingerprint != manifest.style_fingerprint
+        or continuation.character_lock_sha256 != manifest.character_lock_sha256
+        or continuation.anchor_sha256 is not None
+        or continuation.reference_image_sha256s
+    ):
+        raise IllustrationAssetError("anchor_record_preflight_invalid")
+    _validate_job_paths(continuation)
+    if (
+        not continuation.reference_scene_ids
+        or continuation.reference_scene_ids[0] != job.scene_id
+        or continuation.reference_scene_ids.count(job.scene_id) != 1
+    ):
+        raise IllustrationAssetError("anchor_record_preflight_invalid")
+    prospective_anchor_sha = "0" * 64
+    reference_hashes = [prospective_anchor_sha]
+    for scene_id in continuation.reference_scene_ids[1:]:
+        references = [
+            item
+            for item in manifest.jobs
+            if item.scene_id == scene_id and item.phase in {"anchor", "legacy"}
+        ]
+        if len(references) != 1:
+            raise IllustrationAssetError("anchor_record_preflight_invalid")
+        try:
+            validate_generated_image_job(references[0])
+        except IllustrationAssetError:
+            raise IllustrationAssetError("anchor_record_preflight_invalid") from None
+        assert references[0].master_sha256 is not None
+        reference_hashes.append(references[0].master_sha256)
+    prospective = continuation.model_copy(
+        update={
+            "anchor_sha256": prospective_anchor_sha,
+            "reference_image_sha256s": tuple(reference_hashes),
+            "prompt_sha256": image_prompt_identity_sha256(
+                prompt=continuation.prompt,
+                style_fingerprint=continuation.style_fingerprint,
+                character_lock_sha256=continuation.character_lock_sha256,
+                reference_image_sha256s=tuple(reference_hashes),
+            ),
+        }
+    )
+    _validate_continuation_binding_values(
+        prospective, prospective, prospective_anchor_sha
+    )
 
 
 def inspect_image(path: Path) -> ImageFacts:
@@ -415,15 +708,25 @@ def inspect_image(path: Path) -> ImageFacts:
 def _validate_job_paths(job: ImageJob) -> None:
     root = _canonical_safe_root(job.episode_root)
     expected_root = root / "media" / "illustration" / "images"
-    expected_master = expected_root / f"{job.scene_id}_master.png"
-    expected_bw = expected_root / f"{job.scene_id}_bw.png"
+    if job.phase == "legacy":
+        expected_master = expected_root / f"{job.scene_id}_master.png"
+        expected_bw: Path | None = expected_root / f"{job.scene_id}_bw.png"
+    else:
+        expected_master = expected_root / f"{job.scene_id}_{job.phase}.png"
+        expected_bw = None
     if (
         Path(os.path.abspath(job.output_master)) != expected_master
-        or Path(os.path.abspath(job.output_bw)) != expected_bw
+        or (expected_bw is None and job.output_bw is not None)
+        or (expected_bw is not None and job.output_bw is None)
+        or (
+            expected_bw is not None
+            and job.output_bw is not None
+            and Path(os.path.abspath(job.output_bw)) != expected_bw
+        )
         or not expected_master.is_relative_to(root)
-        or not expected_bw.is_relative_to(root)
+        or (expected_bw is not None and not expected_bw.is_relative_to(root))
         or _redirect_in_existing_chain(expected_master)
-        or _redirect_in_existing_chain(expected_bw)
+        or (expected_bw is not None and _redirect_in_existing_chain(expected_bw))
     ):
         raise IllustrationAssetError("unsafe_image_path")
 

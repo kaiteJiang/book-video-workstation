@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import bv.illustration.planner as illustration_planner
 from bv.asr.alignment import AlignedCharacter, AlignedScript, PronunciationReport
 from bv.content.scripts import SemanticLock
 from bv.illustration.contracts import StyleDecision
@@ -17,6 +18,7 @@ from bv.illustration.planner import (
     plan_illustrations,
 )
 from bv.models.contracts import PromptAsset
+from bv.production.profile import ProductionProfile
 from bv.subtitles.generate import SubtitleCue
 
 
@@ -136,7 +138,11 @@ def _style(text: str = TEXT) -> StyleDecision:
 
 
 def _prompt() -> PromptAsset:
-    text = "BV_ILLUSTRATION_STORYBOARD_V1"
+    text = (
+        "BV_ILLUSTRATION_STORYBOARD_V1\n"
+        "semantic_turn_offset identifies a natural semantic transition.\n"
+        "The continuation advances one physical action without changing identity, clothing, setting, camera direction, or style."
+    )
     return PromptAsset(name="storyboard", text=text, sha256=_sha(text))
 
 
@@ -172,6 +178,29 @@ def _draft(scene_count: int, *, recurring_count: int | None = None, deviation: s
         ],
         "narrative_deviation_reason": deviation,
     }
+
+
+def _pair_draft(scene_count: int, *, semantic_turn_offset: int) -> dict[str, object]:
+    draft = _draft(scene_count)
+    scenes = draft["scenes"]
+    assert isinstance(scenes, list)
+    for scene in scenes:
+        assert isinstance(scene, dict)
+        scene.update(
+            {
+                "semantic_turn_offset": semantic_turn_offset,
+                "continuation_action": "收起手机后握住笔记本，转身离开车厢门边",
+                "continuation_prompt": "同一通勤车厢同一侧后方机位，人物收起手机后握住笔记本转身",
+                "continuity_constraints": [
+                    "same character identity",
+                    "same clothing",
+                    "same setting",
+                    "same camera direction",
+                    "same visual style",
+                ],
+            }
+        )
+    return draft
 
 
 def _fugui_draft(scene_count: int) -> dict[str, object]:
@@ -211,6 +240,13 @@ class ScriptedModel:
         return schema_type.model_validate(self.response)
 
 
+def _source_payload(prompt: str) -> dict[str, object]:
+    encoded = prompt.split("BEGIN_SOURCE_DATA\n", maxsplit=1)[1].split(
+        "\nEND_SOURCE_DATA", maxsplit=1
+    )[0]
+    return json.loads(json.loads(encoded))
+
+
 def _plan(
     tmp_path: Path,
     *,
@@ -219,6 +255,10 @@ def _plan(
     cue_count: int = 9,
     draft: dict[str, object] | None = None,
     aligned: AlignedScript | None = None,
+    sequence_mode: str = "legacy-monochrome-reveal",
+    target_scene_count: int | None = None,
+    seconds_per_scene_min: float | None = None,
+    seconds_per_scene_max: float | None = None,
 ):
     cues = _cues(text, duration_ms, cue_count)
     windows = partition_illustration_timeline(cues, master_duration_ms=duration_ms)
@@ -234,8 +274,159 @@ def _plan(
         model=model,
         request_root=tmp_path / "requests",
         prompt_asset=_prompt(),
+        sequence_mode=sequence_mode,
+        target_scene_count=target_scene_count,
+        seconds_per_scene_min=seconds_per_scene_min,
+        seconds_per_scene_max=seconds_per_scene_max,
     )
     return result, model
+
+
+def test_semantic_turn_resolves_to_first_timed_character_after_boundary() -> None:
+    aligned = _aligned("abcdefghijklmnopqrstuvwxyz0123456789", 3_600)
+
+    span, turn_ms, turn_frame = illustration_planner.resolve_semantic_turn(
+        scene_span=(10, 30),
+        semantic_turn_offset=8,
+        aligned_script=aligned,
+    )
+
+    assert span == (10, 18)
+    assert turn_ms == aligned.characters[18].start_ms
+    assert turn_frame == round(turn_ms * 30 / 1000)
+
+
+@pytest.mark.parametrize("semantic_turn_offset", [0, 20])
+def test_semantic_turn_must_be_strictly_inside_scene(
+    semantic_turn_offset: int,
+) -> None:
+    aligned = _aligned("abcdefghijklmnopqrstuvwxyz0123456789", 3_600)
+
+    with pytest.raises(IllustrationPlanError, match="semantic_turn_outside_scene"):
+        illustration_planner.resolve_semantic_turn(
+            scene_span=(10, 30),
+            semantic_turn_offset=semantic_turn_offset,
+            aligned_script=aligned,
+        )
+
+
+def test_semantic_turn_requires_timing_in_remaining_scene() -> None:
+    aligned = _aligned("abcdefghijklmnopqrstuvwxyz0123456789", 3_600)
+    characters = list(aligned.characters)
+    for index in range(18, 30):
+        characters[index] = characters[index].model_copy(
+            update={"start_ms": None, "end_ms": None}
+        )
+
+    with pytest.raises(IllustrationPlanError, match="semantic_turn_alignment_missing"):
+        illustration_planner.resolve_semantic_turn(
+            scene_span=(10, 30),
+            semantic_turn_offset=8,
+            aligned_script=aligned.model_copy(update={"characters": tuple(characters)}),
+        )
+
+
+def test_semantic_turn_keeps_boundary_when_next_character_has_first_timing() -> None:
+    aligned = _aligned("abcdefghijklmnopqrstuvwxyz0123456789", 3_600)
+    characters = list(aligned.characters)
+    characters[18] = characters[18].model_copy(
+        update={"start_ms": None, "end_ms": None}
+    )
+    aligned = aligned.model_copy(update={"characters": tuple(characters)})
+
+    span, turn_ms, turn_frame = illustration_planner.resolve_semantic_turn(
+        scene_span=(10, 30),
+        semantic_turn_offset=8,
+        aligned_script=aligned,
+    )
+
+    assert span == (10, 18)
+    assert turn_ms == aligned.characters[19].start_ms
+    assert turn_frame == round(aligned.characters[19].start_ms * 30 / 1000)
+
+
+def test_legacy_plan_source_payload_omits_sequence_mode(tmp_path: Path) -> None:
+    (_, storyboard), model = _plan(tmp_path)
+
+    assert "sequence_mode" not in _source_payload(model.calls[0][0])
+    assert storyboard.sequence_mode == "legacy-monochrome-reveal"
+
+
+def test_living_pair_profile_sends_four_windows_for_135_seconds(tmp_path: Path) -> None:
+    profile = ProductionProfile.living_default()
+    text = TEXT * 8
+    (_, storyboard), model = _plan(
+        tmp_path,
+        text=text,
+        duration_ms=135_000,
+        cue_count=30,
+        draft=_pair_draft(4, semantic_turn_offset=8),
+        sequence_mode=profile.visual.sequence_mode,
+        target_scene_count=profile.visual.scene_count,
+        seconds_per_scene_min=profile.visual.seconds_per_scene_min,
+        seconds_per_scene_max=profile.visual.seconds_per_scene_max,
+    )
+
+    assert len(storyboard.scenes) == 4
+    assert len(model.calls) == 1
+    assert len(_source_payload(model.calls[0][0])["fixed_windows"]) == 4
+
+
+def test_pair_plan_maps_semantic_turn_and_continuation_from_model(tmp_path: Path) -> None:
+    text = TEXT * 3
+    (character, storyboard), model = _plan(
+        tmp_path,
+        text=text,
+        duration_ms=37_500,
+        cue_count=12,
+        draft=_pair_draft(4, semantic_turn_offset=8),
+        sequence_mode="color-story-pair",
+        target_scene_count=4,
+    )
+
+    assert len(storyboard.scenes) == 4
+    for scene in storyboard.scenes:
+        expected_span, expected_ms, expected_frame = illustration_planner.resolve_semantic_turn(
+            scene_span=scene.narration_span,
+            semantic_turn_offset=8,
+            aligned_script=_aligned(text, 37_500),
+        )
+        assert scene.semantic_turn_span == expected_span
+        assert scene.semantic_turn_ms == expected_ms
+        assert scene.semantic_turn_frame == expected_frame
+        assert scene.continuation_action == "收起手机后握住笔记本，转身离开车厢门边"
+        assert scene.continuation_prompt == "同一通勤车厢同一侧后方机位，人物收起手机后握住笔记本转身"
+        assert scene.continuity_constraints == (
+            "same character identity",
+            "same clothing",
+            "same setting",
+            "same camera direction",
+            "same visual style",
+        )
+    assert character.characters[0].character_id == "reader-01"
+    prompt = model.calls[0][0]
+    assert '\\"sequence_mode\\":\\"color-story-pair\\"' in prompt
+    assert "semantic_turn_offset identifies a natural semantic transition" in prompt
+    assert [scene.scene_id for scene in storyboard.scenes if scene.representative_frame] == [
+        "S01", "S03", "S04"
+    ]
+
+
+@pytest.mark.parametrize("semantic_turn_offset", [1, 15])
+def test_pair_plan_rejects_turns_that_break_renderer_dwell_bounds(
+    tmp_path: Path,
+    semantic_turn_offset: int,
+) -> None:
+    with pytest.raises(IllustrationPlanError, match="invalid_visual_plan"):
+        _plan(
+            tmp_path,
+            text=TEXT,
+            duration_ms=12_000,
+            cue_count=9,
+            draft=_pair_draft(3, semantic_turn_offset=semantic_turn_offset),
+            sequence_mode="color-story-pair",
+            target_scene_count=3,
+        )
 
 
 def test_fifteen_second_plan_has_three_gapless_scenes(tmp_path: Path) -> None:
@@ -341,6 +532,8 @@ def test_visual_plan_schema_requires_every_declared_field(tmp_path: Path) -> Non
     assert set(schema["required"]) == set(schema["properties"])
     character_schema = schema["$defs"]["_CharacterDraft"]
     assert set(character_schema["required"]) == set(character_schema["properties"])
+    scene_schema = schema["$defs"]["_SceneDraft"]
+    assert set(scene_schema["required"]) == set(scene_schema["properties"])
 
 
 def test_key_lines_are_short_and_not_full_subtitles(tmp_path: Path) -> None:
@@ -388,6 +581,32 @@ def test_fiction_representatives_cover_the_source_protagonist_in_each_timeline_t
         scene.character_refs == ("source-protagonist",)
         for scene in representatives
     )
+
+
+def test_first_person_named_narrator_can_anchor_source_protagonist(
+    tmp_path: Path,
+) -> None:
+    text = TEXT + "我叫孙少平。上学时，我总等人少了，才去拿两个黑面馍。"
+    draft = _fugui_draft(3)
+    characters = draft["characters"]
+    assert isinstance(characters, list)
+    source = characters[1]
+    assert isinstance(source, dict)
+    source["role"] = "孙少平，黄土高原青年"
+
+    (bible, storyboard), model = _plan(tmp_path, text=text, draft=draft)
+
+    assert "source-protagonist" in {
+        character.character_id for character in bible.characters
+    }
+    assert sum(
+        scene.character_refs == ("source-protagonist",)
+        for scene in storyboard.scenes
+    ) == 2
+    assert _source_payload(model.calls[0][0])["allowed_character_ids"] == [
+        "reader-01",
+        "source-protagonist",
+    ]
 
 
 def test_model_cannot_change_fixed_scene_identity(tmp_path: Path) -> None:

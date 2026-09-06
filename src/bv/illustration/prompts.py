@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -32,6 +33,7 @@ def compile_image_prompt(
     character_lock: CharacterLock | CharacterBible,
     reference_scene_ids: tuple[str, ...] = (),
     reference_image_sha256s: tuple[str, ...] = (),
+    phase: Literal["legacy", "anchor", "continuation"] = "legacy",
 ) -> CompiledImagePrompt:
     if any(not _is_sha256(value) for value in reference_image_sha256s):
         raise ValueError("invalid_reference_image_hash")
@@ -58,6 +60,17 @@ def compile_image_prompt(
         for character in referenced
     ) or "- 本场景不出现需要锁定外观的角色"
     style_blocks = "\n".join(f"- {item}" for item in style.prompt_blocks)
+    phase_instructions = ""
+    if phase == "anchor":
+        phase_instructions = "\n剧情对阶段：A（锚点图）。呈现转折前已经发生的动作。\n"
+    elif phase == "continuation":
+        phase_instructions = (
+            "\n剧情对阶段：B（延续图）。必须以第一张参考图延续人物、服装、场所、"
+            "镜头方向、道具和画风；仅推进旁白支持的一个动作。\n"
+            f"延续动作：{scene.continuation_action}\n"
+            f"延续画面：{scene.continuation_prompt}\n"
+            f"连续性约束：{'；'.join(scene.continuity_constraints or ())}\n"
+        )
     prompt = (
         "生成一张 1080×1920、9:16 全屏竖版的单幅手绘插画。水彩纸画布铺满整个画面，"
         "构图从边缘延伸到边缘，不要正方形画芯、上下留白条、边框或画中画。\n"
@@ -76,6 +89,7 @@ def compile_image_prompt(
         f"画面内容：{scene.image_prompt}\n"
         f"只出现这些角色：{'、'.join(scene.character_refs) or '不出现固定主人公'}\n"
         f"身份参考场景：{'、'.join(reference_scene_ids) or '无，建立初始身份'}\n\n"
+        f"{phase_instructions}"
         "硬性限制：主体和所有可见肢体、道具必须完整落在画布内；顶部、底部和右侧留出安全空间。"
         "画中不得出现任何文字、字母、数字、字幕、书名、书中文字页、假书封、Logo 或水印。"
         "不要增加旁白中没有的事实、引语、疗效、保证或人物经历。\n"

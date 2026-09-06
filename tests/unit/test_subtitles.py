@@ -140,6 +140,56 @@ def test_build_cues_keeps_protected_terms_together_across_cues_and_lines() -> No
     assert all("百年\n孤独" not in cue.text for cue in cues)
 
 
+def test_build_cues_honors_verified_semantic_chunks_without_mechanical_splits() -> None:
+    text = "阎真的《沧浪之水》，可以当作一张人格变化的账单来读。替自己的选择找理由。"
+    chunks = (
+        "阎真的《沧浪之水》，",
+        "可以当作一张",
+        "人格变化的账单来读。",
+        "替自己的选择找理由。",
+    )
+
+    cues = build_cues(
+        _aligned(text),
+        semantic_chunks=chunks,
+        min_duration_ms=100,
+    )
+
+    assert [cue.text.replace("\n", "") for cue in cues] == list(chunks)
+    assert _visible(cues) == text
+
+
+def test_build_cues_rejects_semantic_chunks_that_change_the_approved_script() -> None:
+    aligned = _aligned("选择总有代价，人能决定自己愿意付哪一种。")
+
+    with pytest.raises(SubtitleError, match="semantic_chunks_text_mismatch"):
+        build_cues(
+            aligned,
+            semantic_chunks=("选择没有代价，", "人能决定自己愿意付哪一种。"),
+            min_duration_ms=100,
+        )
+
+
+def test_build_cues_fails_closed_instead_of_merging_verified_semantic_chunks() -> None:
+    aligned = _aligned("甲乙丙丁戊己")
+
+    with pytest.raises(SubtitleError, match="insufficient_cue_duration"):
+        build_cues(
+            aligned,
+            semantic_chunks=("甲乙丙", "丁戊己"),
+        )
+
+
+def test_build_cues_keeps_existing_fallback_when_no_semantic_chunks_exist() -> None:
+    aligned = _aligned("第一句话很完整。第二段内容写在这里。")
+
+    assert build_cues(aligned, min_duration_ms=100) == build_cues(
+        aligned,
+        semantic_chunks=(),
+        min_duration_ms=100,
+    )
+
+
 def test_build_cues_allows_an_indivisible_protected_term_longer_than_target() -> None:
     text = "请记住这个超长不可拆分核心概念名称然后继续。"
     term = "超长不可拆分核心概念名称"
@@ -267,7 +317,7 @@ def test_render_ass_uses_live_template_safe_area_and_single_line_punctuation_fre
     assert "Test Subtitle Font" in rendered
     assert (
         "Style: BV_Task17_Default,Test Subtitle Font,68,&H00FFFFFF,"
-        "&H000000FF,&H00101010,&H78000000,-1,0,0,0,100,100,0,0,3,10,0,2,84,84,220,1"
+        "&H000000FF,&H00101010,&HFF000000,-1,0,0,0,100,100,0,0,1,5,0,2,84,84,220,1"
         in rendered
     )
     assert "0:00:00.00,0:00:00.61" in rendered
@@ -341,6 +391,33 @@ def test_render_ass_accepts_verified_true_type_collection(tmp_path: Path) -> Non
     )
 
     assert "Style: BV_Task17_Default,Microsoft YaHei" in rendered
+
+
+def test_render_ass_uses_microsoft_yahei_without_a_background_box(
+    tmp_path: Path,
+) -> None:
+    font_path = tmp_path / "subtitle.ttc"
+    font_bytes = b"ttcf\x00\x02\x00\x00Task17 test font collection"
+    font_path.write_bytes(font_bytes)
+
+    rendered = render_ass(
+        (SubtitleCue(index=0, start_ms=0, end_ms=600, text="批准文本。"),),
+        font_path=font_path,
+        font_sha256=_sha(font_bytes),
+        font_family="Microsoft YaHei",
+    )
+    style = next(
+        line.removeprefix("Style: ").split(",")
+        for line in rendered.splitlines()
+        if line.startswith("Style: BV_Task17_Default,")
+    )
+
+    assert style[1] == "Microsoft YaHei"
+    assert style[6] == "&HFF000000"
+    assert style[15] == "1"
+    assert int(style[16]) > 0
+    assert style[17] == "0"
+    assert style[18] == "2"
 
 
 def test_render_ass_rejects_near_miss_true_type_collection_signature(

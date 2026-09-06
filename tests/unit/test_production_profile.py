@@ -63,6 +63,7 @@ def test_missing_profile_uses_legacy_defaults(tmp_path: Path) -> None:
 
     assert profile.tts.provider == "indextts2"
     assert profile.tts.voice_type == "黑金3"
+    assert profile.visual.sequence_mode == "legacy-monochrome-reveal"
     assert profile.duration.model_dump() == {
         "hard_min_seconds": 45.0,
         "ideal_min_seconds": 48.0,
@@ -81,6 +82,7 @@ def test_short_book_default_locks_new_video_contract() -> None:
         "hard_max_seconds": 45.0,
     }
     assert profile.visual.scene_count == 4
+    assert profile.visual.sequence_mode == "color-story-pair"
     assert profile.visual.style_id == "retro-gouache-concept"
     assert profile.visual.representative_count == 3
 
@@ -103,6 +105,13 @@ def test_living_profile_parses_approved_schema(tmp_path: Path) -> None:
         "subtitles",
         "manifest",
     )
+
+
+def test_living_default_uses_color_story_pairs() -> None:
+    visual = ProductionProfile.living_default().visual
+
+    assert visual.sequence_mode == "color-story-pair"
+    assert visual.scene_count == 4
 
 
 def test_doubao_profile_can_persist_approved_voice_id(tmp_path: Path) -> None:
@@ -143,12 +152,10 @@ def test_profile_hash_changes_when_duration_changes(tmp_path: Path) -> None:
     assert production_profile_sha256(tmp_path) != first
 
 
-def test_profile_hash_is_deterministic_for_legacy_default(tmp_path: Path) -> None:
-    first = production_profile_sha256(tmp_path)
-    second = production_profile_sha256(tmp_path)
-
-    assert first == second
-    assert len(first) == 64
+def test_missing_profile_hash_preserves_legacy_shape(tmp_path: Path) -> None:
+    assert production_profile_sha256(tmp_path) == (
+        "0c200f6028fd4daba3087e7c3d4210ac7bf8c2b185b8ce26a75ca3da4c4d5019"
+    )
 
 
 def test_redirected_profile_is_rejected(tmp_path: Path) -> None:

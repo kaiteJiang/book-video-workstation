@@ -10,13 +10,56 @@ import {Scene} from './Scene';
 import {sceneDurationFrames, transitionFramesFor} from './timeline';
 import type {SafeArea, SceneData, Storyboard} from './types';
 
+const TitleOverlay: React.FC<{
+  value: Storyboard['title_overlay'];
+}> = ({value}) =>
+  value ? (
+    <AbsoluteFill
+      style={{
+        zIndex: 100,
+        pointerEvents: 'none',
+        alignItems: 'center',
+        paddingTop: 104,
+        color: '#123858',
+        fontFamily:
+          'Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif',
+        textAlign: 'center',
+      }}
+    >
+      <div
+        style={{
+          fontSize: 88,
+          fontWeight: 700,
+          lineHeight: 1.12,
+          letterSpacing: 8,
+          textShadow: '0 2px 10px rgba(255,253,247,0.9)',
+        }}
+      >
+        {value.title}
+      </div>
+      <div
+        style={{
+          marginTop: 18,
+          fontSize: 44,
+          fontWeight: 500,
+          lineHeight: 1.2,
+          letterSpacing: 10,
+          textShadow: '0 2px 8px rgba(255,253,247,0.9)',
+        }}
+      >
+        {value.author}
+      </div>
+    </AbsoluteFill>
+  ) : null;
+
 const PageFlipScene: React.FC<{
   scene: SceneData;
   safeArea: SafeArea;
   durationInFrames: number;
   transitionFrames: number;
   isLast: boolean;
-}> = ({scene, safeArea, durationInFrames, transitionFrames, isLast}) => {
+  showKeyLine: boolean;
+}> = ({scene, safeArea, durationInFrames, transitionFrames, isLast, showKeyLine}) => {
   const frame = useCurrentFrame();
   const progress = isLast
     ? 0
@@ -40,7 +83,7 @@ const PageFlipScene: React.FC<{
           backfaceVisibility: 'hidden',
         }}
       >
-        <Scene scene={scene} safeArea={safeArea} />
+        <Scene scene={scene} safeArea={safeArea} showKeyLine={showKeyLine} />
       </AbsoluteFill>
     </AbsoluteFill>
   );
@@ -55,7 +98,11 @@ const CutStoryVideo: React.FC<{value: Storyboard}> = ({value}) => (
         durationInFrames={sceneDurationFrames(scene)}
         name={`Scene ${scene.id}`}
       >
-        <Scene scene={scene} safeArea={value.safe_area} />
+        <Scene
+          scene={scene}
+          safeArea={value.safe_area}
+          showKeyLine={value.project.show_key_line !== false}
+        />
       </Sequence>
     ))}
   </AbsoluteFill>
@@ -79,6 +126,7 @@ const PageFlipStoryVideo: React.FC<{value: Storyboard}> = ({value}) => {
             durationInFrames={sceneDurationFrames(scene)}
             transitionFrames={transitionFrames}
             isLast={index === value.scenes.length - 1}
+            showKeyLine={value.project.show_key_line !== false}
           />
         </Sequence>
       ))}
@@ -91,7 +139,8 @@ const CrossDissolveScene: React.FC<{
   safeArea: SafeArea;
   transitionFrames: number;
   isFirst: boolean;
-}> = ({scene, safeArea, transitionFrames, isFirst}) => {
+  showKeyLine: boolean;
+}> = ({scene, safeArea, transitionFrames, isFirst, showKeyLine}) => {
   const frame = useCurrentFrame();
   const opacity = isFirst
     ? 1
@@ -106,6 +155,7 @@ const CrossDissolveScene: React.FC<{
         scene={scene}
         safeArea={safeArea}
         immediateIllustration
+        showKeyLine={showKeyLine}
       />
     </AbsoluteFill>
   );
@@ -132,6 +182,7 @@ const CrossDissolveStoryVideo: React.FC<{value: Storyboard}> = ({value}) => {
             safeArea={value.safe_area}
             transitionFrames={transitionFrames}
             isFirst={index === 0}
+            showKeyLine={value.project.show_key_line !== false}
           />
         </Sequence>
       ))}
@@ -139,13 +190,17 @@ const CrossDissolveStoryVideo: React.FC<{value: Storyboard}> = ({value}) => {
   );
 };
 
-export const StoryboardVideo: React.FC<{value: Storyboard}> = ({value}) =>
-  value.project.transition === 'cross-dissolve' && value.scenes.length > 1 ? (
-    <CrossDissolveStoryVideo value={value} />
-  ) : value.project.transition === 'page-flip' && value.scenes.length > 1 ? (
-    <PageFlipStoryVideo value={value} />
-  ) : (
-    <CutStoryVideo value={value} />
+export const StoryboardVideo: React.FC<{value: Storyboard}> = ({value}) => (
+  <AbsoluteFill style={{backgroundColor: PAPER_COLOR}}>
+    {value.project.transition === 'cross-dissolve' && value.scenes.length > 1 ? (
+      <CrossDissolveStoryVideo value={value} />
+    ) : value.project.transition === 'page-flip' && value.scenes.length > 1 ? (
+      <PageFlipStoryVideo value={value} />
+    ) : (
+      <CutStoryVideo value={value} />
+    )}
+    <TitleOverlay value={value.title_overlay} />
+  </AbsoluteFill>
   );
 
 export const StoryVideo: React.FC<Storyboard> = (value) => (

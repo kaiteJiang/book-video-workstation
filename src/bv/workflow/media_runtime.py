@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 from typing import Literal, Protocol
 
@@ -15,10 +16,27 @@ from bv.core.hashing import sha256_file
 from bv.delivery.exporter import ApprovalRecord, DeliveryBundle, DeliveryExporter, DeliveryRequest
 from bv.illustration.assets import (
     IllustrationManifest,
-    import_image_master,
+    import_image_asset,
     record_imported_image,
 )
 from bv.illustration.contracts import IllustrationStoryboard
+from bv.illustration.prompts import canonical_model_sha256
+from bv.illustration.replacement import (
+    IllustrationReplacementError,
+    ReplacementImportResult,
+    ReplacementPreparation,
+    ensure_ordinary_import_allowed,
+    import_authorized_replacement,
+    prepare_illustration_replacement,
+)
+from bv.illustration.restyle import (
+    IllustrationRestyleError,
+    RestyleProvenance,
+    RestyleResult,
+    restyle_illustrations,
+    rollback_restyle_install,
+    validate_current_illustration_provenance,
+)
 from bv.illustration.reviews import (
     RepresentativeApproval,
     RepresentativeReview,
@@ -43,6 +61,11 @@ from bv.voice.audition import (
     require_current_voice_profile,
 )
 from bv.production.profile import load_production_profile
+from bv.subtitles.inputs import (
+    SubtitleBreakInputError,
+    load_subtitle_approved_text,
+    load_subtitle_break_input,
+)
 from bv.workflow.runtime import RuntimeAuthorization
 
 from .stages import (
@@ -58,6 +81,60 @@ class MediaWorkflowError(RuntimeError):
     def __init__(self, error_code: str) -> None:
         self.error_code = error_code
         super().__init__(error_code)
+
+
+def _catalog_identity(path: Path) -> tuple[Path, str]:
+    candidate = Path(os.path.abspath(path))
+    current = candidate
+    try:
+        while True:
+            if os.path.lexists(current):
+                attributes = getattr(
+                    current.stat(follow_symlinks=False),
+                    "st_file_attributes",
+                    0,
+                )
+                if current.is_symlink() or attributes & getattr(
+                    os, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400
+                ):
+                    raise ValueError
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        if not candidate.is_file():
+            raise ValueError
+        resolved = candidate.resolve(strict=True)
+        return resolved, sha256_file(resolved)
+    except (OSError, ValueError):
+        raise MediaWorkflowError("media_catalog_configuration_invalid") from None
+
+
+def _trusted_catalog_path(
+    stages: Mapping[str, StageRunner],
+    explicit: Path | None,
+) -> Path | None:
+    from .media_stages import PrepareIllustrationsStage, StyleSelectionStage
+
+    select = stages.get("select_style")
+    prepare = stages.get("prepare_representatives")
+    select_is_provider = type(select) is StyleSelectionStage
+    prepare_is_provider = type(prepare) is PrepareIllustrationsStage
+    if select_is_provider != prepare_is_provider:
+        raise MediaWorkflowError("media_catalog_configuration_invalid")
+    candidates: list[Path] = []
+    if select_is_provider:
+        assert type(select) is StyleSelectionStage
+        assert type(prepare) is PrepareIllustrationsStage
+        candidates.extend((select.catalog_path, prepare.catalog_path))
+    if explicit is not None:
+        candidates.append(Path(explicit))
+    if not candidates:
+        return None
+    identities = tuple(_catalog_identity(candidate) for candidate in candidates)
+    if len(set(identities)) != 1:
+        raise MediaWorkflowError("media_catalog_configuration_invalid")
+    return identities[0][0]
 
 
 class MediaProductionView(BaseModel):
@@ -159,21 +236,147 @@ class MediaProductionService:
         stages: Mapping[str, StageRunner],
         images: IllustrationGateway,
         config_sha256: str = "0" * 64,
+        legacy_config_sha256: str | None = None,
+        stage_config_sha256s: Mapping[str, str] | None = None,
+        stage_config_sha256_resolver: Callable[[str, Path], str] | None = None,
         configured_mode: Literal["technical_sample", "full"] | None = None,
         cover: CoverGateway | None = None,
         social_cover: SocialCoverGateway | None = None,
         delivery: DeliveryGateway | None = None,
         voice_auditions: VoiceAuditionGateway | None = None,
+        restyle_catalog_path: Path | None = None,
+        book_menu_refresher: Callable[[], object] | None = None,
     ) -> None:
         self.store = store
         self.stages = dict(stages)
         self.images = images
         self.config_sha256 = config_sha256
+        self.legacy_config_sha256 = legacy_config_sha256
+        self.stage_config_sha256s = (
+            None if stage_config_sha256s is None else dict(stage_config_sha256s)
+        )
+        self.stage_config_sha256_resolver = stage_config_sha256_resolver
+        if (
+            self.stage_config_sha256s is not None
+            and stage_config_sha256_resolver is not None
+        ):
+            raise MediaWorkflowError("media_stage_config_invalid")
+        if self.stage_config_sha256s is not None and any(
+            len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+            for value in self.stage_config_sha256s.values()
+        ):
+            raise MediaWorkflowError("media_stage_config_invalid")
+        if legacy_config_sha256 is not None and (
+            len(legacy_config_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in legacy_config_sha256
+            )
+        ):
+            raise MediaWorkflowError("media_stage_config_invalid")
         self.configured_mode = configured_mode
         self.cover = cover
         self.social_cover = social_cover
         self.delivery = delivery
         self.voice_auditions = voice_auditions
+        self.restyle_catalog_path = _trusted_catalog_path(
+            self.stages,
+            None if restyle_catalog_path is None else Path(restyle_catalog_path),
+        )
+        self.book_menu_refresher = book_menu_refresher
+
+    def reject_illustration(
+        self,
+        book_id: str,
+        episode_id: str,
+        *,
+        asset_id: str,
+        expected_asset_sha256: str,
+        reason: str,
+        expected_representative_review_sha256: str | None = None,
+    ) -> ReplacementPreparation:
+        try:
+            return prepare_illustration_replacement(
+                store=self.store,
+                book_id=book_id,
+                episode_id=episode_id,
+                asset_id=asset_id,
+                expected_asset_sha256=expected_asset_sha256,
+                catalog_path=self.restyle_catalog_path,
+                expected_representative_review_sha256=(
+                    expected_representative_review_sha256
+                ),
+                reason=reason,
+            )
+        except IllustrationReplacementError as error:
+            raise MediaWorkflowError(error.error_code) from None
+
+    def import_replacement(
+        self,
+        book_id: str,
+        episode_id: str,
+        *,
+        asset_id: str,
+        nonce: str,
+        source: Path,
+    ) -> ReplacementImportResult:
+        ffmpeg_command = getattr(self.images, "ffmpeg_command", None)
+        if not isinstance(ffmpeg_command, (str, Path)):
+            raise MediaWorkflowError("replacement_import_not_configured")
+        try:
+            return import_authorized_replacement(
+                store=self.store,
+                book_id=book_id,
+                episode_id=episode_id,
+                asset_id=asset_id,
+                nonce=nonce,
+                source_path=Path(source),
+                ffmpeg_command=ffmpeg_command,
+            )
+        except IllustrationReplacementError as error:
+            raise MediaWorkflowError(error.error_code) from None
+
+    def restyle(
+        self,
+        book_id: str,
+        episode_id: str,
+        *,
+        style_id: str,
+    ) -> MediaProductionView:
+        episode = self._load(book_id, episode_id)
+        if self.restyle_catalog_path is None:
+            raise MediaWorkflowError("restyle_not_configured")
+        mode = self._restyle_media_mode(episode)
+        state_path = self._episode_root(book_id, episode_id) / "episode.json"
+        try:
+            old_state_bytes = state_path.read_bytes()
+        except OSError:
+            raise MediaWorkflowError("episode_state_unavailable") from None
+        try:
+            result = restyle_illustrations(
+                episode=episode,
+                episode_root=self._episode_root(book_id, episode_id),
+                catalog_path=self.restyle_catalog_path,
+                requested_style_id=style_id,
+            )
+        except IllustrationRestyleError as error:
+            raise MediaWorkflowError(error.error_code) from None
+        try:
+            updated = self._restyled_state(episode, result=result, mode=mode)
+            updated.status = "representative_generation_running"
+            view = self._view(updated, present=(), missing=result.missing_asset_ids)
+            self.store.save_episode(updated)
+        except Exception:
+            try:
+                rollback_restyle_install(
+                    episode_root=self._episode_root(book_id, episode_id), result=result
+                )
+            except IllustrationRestyleError:
+                pass
+            self._restore_episode_bytes(state_path, old_state_bytes)
+            raise MediaWorkflowError("restyle_state_commit_failed") from None
+        return view
 
     def prepare(
         self,
@@ -205,6 +408,19 @@ class MediaProductionService:
                     if error.error_code != "voice_profile_stale"
                     else "voice_profile_stale"
                 ) from None
+        provenance = self._restyle_provenance(
+            episode,
+            allow_original_incomplete=True,
+        )
+        if provenance is not None and any(
+            not self._manifest_current(episode, name, mode=mode)
+            for name in ("select_style", "plan_illustrations", "prepare_representatives")
+        ):
+            return self._resume_restyle_override(
+                episode,
+                mode=mode,
+                requested_style_id=provenance.override.requested_style_id,
+            )
         for name in HANDDRAWN_MEDIA_PREPARE_ORDER:
             if self._manifest_current(episode, name, mode=mode):
                 continue
@@ -216,8 +432,9 @@ class MediaProductionService:
             "representative_generation_running" if missing
             else "awaiting_representative_review"
         )
+        view = self._view(episode, present=present, missing=missing)
         self.store.save_episode(episode)
-        return self._view(episode, present=present, missing=missing)
+        return view
 
     def prepare_voice_audition(
         self,
@@ -335,6 +552,7 @@ class MediaProductionService:
         source: Path,
     ) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._restyle_provenance(episode)
         representative = episode.status in {
             "representative_generation_running", "awaiting_representative_review"
         }
@@ -359,6 +577,7 @@ class MediaProductionService:
 
     def approve_representatives(self, book_id: str, episode_id: str) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._restyle_provenance(episode)
         if episode.status != "awaiting_representative_review":
             raise MediaWorkflowError("representative_gate_not_ready")
         self.images.approve(self._context(episode))
@@ -394,6 +613,7 @@ class MediaProductionService:
 
     def prepare_batch(self, book_id: str, episode_id: str) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._restyle_provenance(episode)
         if episode.status != "representatives_approved":
             raise MediaWorkflowError("representatives_not_approved")
         self.images.unlock(self._context(episode))
@@ -441,6 +661,8 @@ class MediaProductionService:
 
     def render(self, book_id: str, episode_id: str) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._require_current_subtitles_for_downstream(episode)
+        self._restyle_provenance(episode)
         if episode.status != "illustrations_ready":
             raise MediaWorkflowError("render_not_ready")
         if (
@@ -487,6 +709,7 @@ class MediaProductionService:
 
     def approve_final(self, book_id: str, episode_id: str) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._require_current_subtitles_for_downstream(episode)
         if episode.status != "awaiting_final_review" or not self._manifest_current(
             episode, "qc", mode=None
         ) or not self._manifest_current(
@@ -522,16 +745,25 @@ class MediaProductionService:
             raise MediaWorkflowError(code) from None
         episode.status = "final_approved"
         self.store.save_episode(episode)
+        if self.book_menu_refresher is not None:
+            self.book_menu_refresher()
         return self._view(episode)
 
     def status(self, book_id: str, episode_id: str) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
+        self._restyle_provenance(episode)
+        representative_status = episode.status in {
+            "representative_generation_running",
+            "awaiting_representative_review",
+        }
         try:
             if episode.status in {"illustration_batch_running", "illustrations_ready"}:
                 present, missing = self.images.batch_status(self._context(episode))
             else:
                 present, missing = self.images.status(self._context(episode))
         except Exception:
+            if representative_status:
+                raise MediaWorkflowError("representative_surface_invalid") from None
             present, missing = (), ()
         return self._view(episode, present=present, missing=missing)
 
@@ -553,6 +785,17 @@ class MediaProductionService:
         self._record_outcome(episode, name, outcome, mode=mode)
 
     def _record_outcome(
+        self,
+        episode: EpisodeState,
+        name: str,
+        outcome: StageOutcome,
+        *,
+        mode: Literal["technical_sample", "full"] | None,
+    ) -> None:
+        self._apply_outcome_in_memory(episode, name, outcome, mode=mode)
+        self.store.save_episode(episode)
+
+    def _apply_outcome_in_memory(
         self,
         episode: EpisodeState,
         name: str,
@@ -583,13 +826,12 @@ class MediaProductionService:
             status="completed",
             inputs=inputs,
             outputs=outputs,
-            config_sha256=self.config_sha256,
+            config_sha256=self._recorded_config_identity(episode, name),
         )
         if name not in episode.completed_stages:
             episode.completed_stages.append(name)
         if name in episode.stale_stages:
             episode.stale_stages.remove(name)
-        self.store.save_episode(episode)
 
     def _manifest_current(
         self,
@@ -597,21 +839,376 @@ class MediaProductionService:
         name: str,
         *,
         mode: Literal["technical_sample", "full"] | None,
+        require_outputs: bool = False,
     ) -> bool:
         manifest = episode.stage_manifests.get(name)
-        if manifest is None or manifest.status != "completed" or name in episode.stale_stages:
+        expected_config_sha256 = self._expected_config_sha256(episode, name)
+        if (
+            manifest is None
+            or manifest.stage != name
+            or manifest.status != "completed"
+            or name in episode.stale_stages
+            or (require_outputs and not manifest.outputs)
+            or not self._config_identity_current(
+                manifest,
+                expected_sha256=expected_config_sha256,
+            )
+        ):
+            if name == "subtitles":
+                invalidate_from(episode, "subtitles")
             return False
         if mode is not None and manifest.inputs.get("media_mode") != mode:
+            if name == "subtitles":
+                invalidate_from(episode, "subtitles")
+            return False
+        if name == "subtitles" and not self._subtitle_inputs_current(
+            episode,
+            manifest,
+        ):
+            invalidate_from(episode, "subtitles")
             return False
         for artifact in manifest.outputs.values():
             path = Path(artifact.path)
-            if (
-                not path.is_file() or path.is_symlink()
-                or path.stat().st_size != artifact.size_bytes
-                or sha256_file(path) != artifact.sha256
-            ):
+            mutable_restyle_ledger = (
+                name == "prepare_representatives"
+                and "restyle_plan_sha256" in manifest.inputs
+            )
+            try:
+                invalid = (
+                    not self._artifact_path_current(episode, path)
+                    or (
+                        not mutable_restyle_ledger
+                        and (
+                            path.stat().st_size != artifact.size_bytes
+                            or sha256_file(path) != artifact.sha256
+                        )
+                    )
+                )
+            except (OSError, ValueError):
+                invalid = True
+            if invalid:
+                if name == "subtitles":
+                    invalidate_from(episode, "subtitles")
                 return False
         return True
+
+    def _artifact_path_current(self, episode: EpisodeState, path: Path) -> bool:
+        root = self._episode_root(episode.book_id, episode.episode_id)
+        try:
+            canonical_root = Path(os.path.abspath(root))
+            canonical_path = Path(os.path.abspath(path))
+            if (
+                canonical_path == canonical_root
+                or not canonical_path.is_relative_to(canonical_root)
+            ):
+                return False
+            current = canonical_path
+            while True:
+                if os.path.lexists(current):
+                    attributes = getattr(
+                        current.stat(follow_symlinks=False),
+                        "st_file_attributes",
+                        0,
+                    )
+                    if current.is_symlink() or attributes & getattr(
+                        os,
+                        "FILE_ATTRIBUTE_REPARSE_POINT",
+                        0x400,
+                    ):
+                        return False
+                if current == canonical_root:
+                    break
+                parent = current.parent
+                if parent == current:
+                    return False
+                current = parent
+            if not canonical_path.is_file():
+                return False
+            resolved_root = canonical_root.resolve(strict=True)
+            resolved_path = canonical_path.resolve(strict=True)
+            return resolved_path.is_relative_to(resolved_root)
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _subtitle_inputs_current(
+        self,
+        episode: EpisodeState,
+        manifest: StageManifest,
+    ) -> bool:
+        root = self._episode_root(episode.book_id, episode.episode_id)
+        try:
+            break_input = load_subtitle_break_input(root)
+            approved_text = (
+                load_subtitle_approved_text(root)
+                if break_input.present
+                else ""
+            )
+        except (OSError, UnicodeError, SubtitleBreakInputError):
+            return False
+        if break_input.present and not break_input.reconstructs(approved_text):
+            return False
+        expected = {
+            "subtitle_sequence_mode": break_input.sequence_mode,
+            "subtitle_breaks_presence": (
+                "present" if break_input.present else "absent"
+            ),
+        }
+        if any(manifest.inputs.get(key) != value for key, value in expected.items()):
+            return False
+        recorded_sha256 = manifest.inputs.get("subtitle_breaks_sha256")
+        if break_input.sha256 is None:
+            return recorded_sha256 is None
+        return recorded_sha256 == break_input.sha256
+
+    def _require_current_subtitles_for_downstream(
+        self,
+        episode: EpisodeState,
+    ) -> None:
+        mode = self._trusted_downstream_media_mode(episode)
+        if mode is not None and self._manifest_current(
+            episode,
+            "subtitles",
+            mode=mode,
+        ):
+            return
+        invalidate_from(episode, "subtitles")
+        if episode.status != "final_approved":
+            episode.status = "illustration_planning"
+            self.store.save_episode(episode)
+        raise MediaWorkflowError("subtitles_stale")
+
+    def _trusted_downstream_media_mode(
+        self,
+        episode: EpisodeState,
+    ) -> Literal["technical_sample", "full"] | None:
+        if self.configured_mode in {"technical_sample", "full"}:
+            return self.configured_mode
+        evidence: set[str] = set()
+        for name in ("tts", "asr"):
+            manifest = episode.stage_manifests.get(name)
+            try:
+                current = self._manifest_current(
+                    episode,
+                    name,
+                    mode=None,
+                    require_outputs=True,
+                )
+            except MediaWorkflowError:
+                return None
+            if manifest is None or not current:
+                return None
+            recorded = manifest.inputs.get("media_mode")
+            if recorded not in {"technical_sample", "full"}:
+                return None
+            evidence.add(recorded)
+        if len(evidence) != 1:
+            return None
+        mode = next(iter(evidence))
+        return "full" if mode == "full" else "technical_sample"
+
+    def _config_identity_current(
+        self,
+        manifest: StageManifest,
+        *,
+        expected_sha256: str,
+    ) -> bool:
+        scoped = (
+            self.stage_config_sha256s is not None
+            or self.stage_config_sha256_resolver is not None
+        )
+        expected_schema = "stage-v1" if scoped else "global-v1"
+        versioned = f"{expected_schema}:{expected_sha256}"
+        if manifest.config_sha256 == versioned:
+            return True
+        if manifest.config_sha256.startswith(("stage-v1:", "global-v1:")):
+            return False
+        if not scoped:
+            return manifest.config_sha256 == expected_sha256
+        return (
+            self.legacy_config_sha256 is not None
+            and manifest.config_sha256 == self.legacy_config_sha256
+        )
+
+    def _recorded_config_identity(self, episode: EpisodeState, name: str) -> str:
+        schema = (
+            "stage-v1"
+            if self.stage_config_sha256s is not None
+            or self.stage_config_sha256_resolver is not None
+            else "global-v1"
+        )
+        return f"{schema}:{self._expected_config_sha256(episode, name)}"
+
+    def _expected_config_sha256(self, episode: EpisodeState, name: str) -> str:
+        if self.stage_config_sha256_resolver is not None:
+            try:
+                value = self.stage_config_sha256_resolver(
+                    name, self._episode_root(episode.book_id, episode.episode_id)
+                )
+            except Exception:
+                raise MediaWorkflowError("media_stage_config_invalid") from None
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise MediaWorkflowError("media_stage_config_invalid")
+            return value
+        if self.stage_config_sha256s is None:
+            return self.config_sha256
+        base = self.stage_config_sha256s.get(name)
+        if base is None:
+            raise MediaWorkflowError("media_stage_config_missing")
+        return base
+
+    def _restyle_provenance(
+        self,
+        episode: EpisodeState,
+        *,
+        allow_original_incomplete: bool = False,
+    ) -> RestyleProvenance | None:
+        root = self._episode_root(episode.book_id, episode.episode_id)
+        try:
+            return validate_current_illustration_provenance(
+                episode=episode,
+                episode_root=root,
+                catalog_path=self.restyle_catalog_path,
+                allow_original_incomplete=allow_original_incomplete,
+            )
+        except IllustrationRestyleError as error:
+            raise MediaWorkflowError(error.error_code) from None
+
+    def _resume_restyle_override(
+        self,
+        episode: EpisodeState,
+        *,
+        mode: Literal["technical_sample", "full"],
+        requested_style_id: str,
+    ) -> MediaProductionView:
+        if self.restyle_catalog_path is None:
+            raise MediaWorkflowError("restyle_not_configured")
+        root = self._episode_root(episode.book_id, episode.episode_id)
+        state_path = root / "episode.json"
+        try:
+            old_state_bytes = state_path.read_bytes()
+            result = restyle_illustrations(
+                episode=episode,
+                episode_root=root,
+                catalog_path=self.restyle_catalog_path,
+                requested_style_id=requested_style_id,
+                allow_selected_style=True,
+            )
+        except IllustrationRestyleError as error:
+            raise MediaWorkflowError(error.error_code) from None
+        except OSError:
+            raise MediaWorkflowError("episode_state_unavailable") from None
+        try:
+            updated = self._restyled_state(episode, result=result, mode=mode)
+            if any(
+                not self._manifest_current(updated, name, mode=mode)
+                for name in HANDDRAWN_MEDIA_PREPARE_ORDER
+            ):
+                raise MediaWorkflowError("restyle_rebase_requires_upstream")
+            present, missing = self.images.status(self._context(updated))
+            updated.status = (
+                "representative_generation_running" if missing
+                else "awaiting_representative_review"
+            )
+            view = self._view(updated, present=present, missing=missing)
+            self.store.save_episode(updated)
+        except Exception:
+            try:
+                rollback_restyle_install(episode_root=root, result=result)
+            except IllustrationRestyleError:
+                pass
+            self._restore_episode_bytes(state_path, old_state_bytes)
+            raise MediaWorkflowError("restyle_state_commit_failed") from None
+        return view
+
+    def _restyled_state(
+        self,
+        episode: EpisodeState,
+        *,
+        result: RestyleResult,
+        mode: Literal["technical_sample", "full"],
+    ) -> EpisodeState:
+        updated = episode.model_copy(deep=True)
+        invalidate_from(updated, "style_decision")
+        illustration = self._episode_root(
+            episode.book_id, episode.episode_id
+        ) / "media" / "illustration"
+        provenance_inputs = {
+            "requested_style_id": result.selected_style,
+            "style_fingerprint": result.style_fingerprint,
+            "catalog_sha256": result.catalog_sha256,
+            "restyle_override_sha256": result.override_sha256,
+            "restyle_plan_sha256": result.plan_sha256,
+        }
+        self._apply_outcome_in_memory(
+            updated,
+            "select_style",
+            StageOutcome(
+                outputs={"style_decision": illustration / "style_decision.json"},
+                inputs=provenance_inputs,
+            ),
+            mode=mode,
+        )
+        self._apply_outcome_in_memory(
+            updated,
+            "plan_illustrations",
+            StageOutcome(
+                outputs={
+                    "character_bible": illustration / "character_bible.json",
+                    "illustration_storyboard": illustration / "illustration_storyboard.json",
+                },
+                inputs=provenance_inputs,
+            ),
+            mode=mode,
+        )
+        self._apply_outcome_in_memory(
+            updated,
+            "prepare_representatives",
+            StageOutcome(
+                outputs={
+                    "illustration_manifest": illustration / "illustration_manifest.json"
+                },
+                inputs=provenance_inputs,
+            ),
+            mode=mode,
+        )
+        return updated
+
+    @staticmethod
+    def _restore_episode_bytes(path: Path, payload: bytes) -> None:
+        temporary: Path | None = None
+        try:
+            descriptor, name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".restore", dir=path.parent
+            )
+            temporary = Path(name)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        except OSError:
+            return
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    def _restyle_media_mode(
+        self, episode: EpisodeState
+    ) -> Literal["technical_sample", "full"]:
+        names = ("select_style", "plan_illustrations", "prepare_representatives")
+        modes = {episode.stage_manifests.get(name).inputs.get("media_mode") if episode.stage_manifests.get(name) else None for name in names}
+        if len(modes) != 1 or next(iter(modes)) not in {"technical_sample", "full"}:
+            raise MediaWorkflowError("restyle_media_mode_invalid")
+        mode = next(iter(modes))
+        if self.configured_mode is not None and mode != self.configured_mode:
+            raise MediaWorkflowError("restyle_media_mode_invalid")
+        return mode
 
     def _load(self, book_id: str, episode_id: str) -> EpisodeState:
         try:
@@ -641,11 +1238,25 @@ class MediaProductionService:
         missing: tuple[str, ...] = (),
         batch_unlocked: bool = False,
     ) -> MediaProductionView:
+        sequence_mode = None
+        if episode.status in {
+            "representative_generation_running",
+            "awaiting_representative_review",
+        }:
+            sequence_mode = self._validated_representative_mode(
+                episode, present=present, missing=missing
+            )
+        representative_action = "向用户展示开头、中段、结尾三张代表图并等待批准"
+        if sequence_mode == "color-story-pair":
+            representative_action = (
+                "向用户展示开头、中段、结尾三组完整 A/B 代表图，共六张，并逐对检查"
+                "人物/服装/场景/镜头/动作连续性后等待批准"
+            )
         actions = {
             "awaiting_voice_audition_review": "向用户播放同一文稿片段的候选音色并等待批准",
             "voice_profile_approved": "使用已批准音色生成完整旁白",
             "representative_generation_running": "在当前对话生成并导入缺少的代表插画",
-            "awaiting_representative_review": "向用户展示开头、中段、结尾三张代表图并等待批准",
+            "awaiting_representative_review": representative_action,
             "representatives_approved": "准备剩余插画任务",
             "illustration_batch_running": "生成并导入剩余插画",
             "illustrations_ready": "渲染静音手绘画面和最终视频",
@@ -689,6 +1300,107 @@ class MediaProductionService:
             approval_record_path=approval_path,
         )
 
+    def _validated_representative_mode(
+        self,
+        episode: EpisodeState,
+        *,
+        present: tuple[str, ...],
+        missing: tuple[str, ...],
+    ) -> str:
+        root = self._episode_root(episode.book_id, episode.episode_id)
+        illustration = root / "media" / "illustration"
+        try:
+            storyboard = IllustrationStoryboard.model_validate_json(
+                (illustration / "illustration_storyboard.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            manifest = IllustrationManifest.model_validate_json(
+                (illustration / "illustration_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            if (
+                manifest.storyboard_sha256 != canonical_model_sha256(storyboard)
+                or manifest.book_id != episode.book_id
+                or manifest.episode_id != episode.episode_id
+                or manifest.episode_root != root.absolute()
+            ):
+                raise ValueError
+            representatives = tuple(job for job in manifest.jobs if job.representative)
+            storyboard_ids = tuple(
+                scene.scene_id
+                for scene in storyboard.scenes
+                if scene.representative_frame
+            )
+            if storyboard.sequence_mode == "color-story-pair":
+                all_scene_ids = tuple(scene.scene_id for scene in storyboard.scenes)
+                if len(all_scene_ids) == 3:
+                    expected_storyboard_ids = all_scene_ids
+                elif len(all_scene_ids) == 4:
+                    expected_storyboard_ids = (
+                        all_scene_ids[0],
+                        all_scene_ids[2],
+                        all_scene_ids[3],
+                    )
+                else:
+                    raise ValueError
+                expected = tuple(
+                    asset_id
+                    for scene_id in expected_storyboard_ids
+                    for asset_id in (f"{scene_id}-A", f"{scene_id}-B")
+                )
+                manifest_ids = tuple(job.asset_id for job in representatives)
+                expected_identities = tuple(
+                    (scene_id, phase, f"{scene_id}-{suffix}")
+                    for scene_id in expected_storyboard_ids
+                    for phase, suffix in (("anchor", "A"), ("continuation", "B"))
+                )
+                identities = tuple(
+                    (job.scene_id, job.phase, job.asset_id)
+                    for job in representatives
+                )
+                if (
+                    storyboard_ids != expected_storyboard_ids
+                    or manifest_ids != expected
+                    or len(set(manifest_ids)) != 6
+                    or identities != expected_identities
+                    or any(
+                        job.phase == "continuation"
+                        and (
+                            not job.reference_scene_ids
+                            or job.reference_scene_ids[0] != job.scene_id
+                            or job.reference_scene_ids.count(job.scene_id) != 1
+                        )
+                        for job in representatives
+                    )
+                ):
+                    raise ValueError
+            else:
+                expected = tuple(job.scene_id for job in representatives)
+                if (
+                    len(expected) != 3
+                    or len(set(expected)) != 3
+                    or expected != storyboard_ids
+                    or any(
+                        job.phase != "legacy" or job.asset_id is not None
+                        for job in representatives
+                    )
+                ):
+                    raise ValueError
+            if (
+                len(present) + len(missing) != len(expected)
+                or len(set((*present, *missing))) != len(expected)
+                or set(present).intersection(missing)
+                or set((*present, *missing)) != set(expected)
+                or present != tuple(item for item in expected if item in present)
+                or missing != tuple(item for item in expected if item in missing)
+            ):
+                raise ValueError
+            return storyboard.sequence_mode
+        except Exception:
+            raise MediaWorkflowError("representative_surface_invalid") from None
+
 
 class LocalIllustrationGateway:
     def __init__(self, *, ffmpeg_command: str | Path) -> None:
@@ -698,17 +1410,21 @@ class LocalIllustrationGateway:
         manifest = self._manifest(context)
         representatives = tuple(job for job in manifest.jobs if job.representative)
         present = tuple(
-            job.scene_id for job in representatives if job.status in {"generated", "approved"}
+            self._job_id(job) for job in representatives if job.status in {"generated", "approved"}
         )
-        missing = tuple(job.scene_id for job in representatives if job.scene_id not in present)
+        missing = tuple(
+            self._job_id(job) for job in representatives if self._job_id(job) not in present
+        )
         return present, missing
 
     def batch_status(self, context: StageContext) -> tuple[tuple[str, ...], tuple[str, ...]]:
         manifest = self._manifest(context)
         present = tuple(
-            job.scene_id for job in manifest.jobs if job.status in {"generated", "approved"}
+            self._job_id(job) for job in manifest.jobs if job.status in {"generated", "approved"}
         )
-        missing = tuple(job.scene_id for job in manifest.jobs if job.scene_id not in present)
+        missing = tuple(
+            self._job_id(job) for job in manifest.jobs if self._job_id(job) not in present
+        )
         return present, missing
 
     def import_master(
@@ -722,13 +1438,34 @@ class LocalIllustrationGateway:
         manifest = self._manifest(context)
         matches = [
             job for job in manifest.jobs
-            if job.scene_id == scene_id and (job.representative or not representative_only)
+            if self._job_id(job) == scene_id and (job.representative or not representative_only)
         ]
         if len(matches) != 1:
             raise MediaWorkflowError("scene_not_in_representatives")
         try:
-            imported = import_image_master(
-                matches[0], source, ffmpeg_command=self.ffmpeg_command
+            ensure_ordinary_import_allowed(
+                episode_root=context.episode_root,
+                state=getattr(context, "episode_state", None),
+                manifest=manifest,
+                asset_id=scene_id,
+            )
+        except IllustrationReplacementError as error:
+            raise MediaWorkflowError(error.error_code) from None
+        pending = next(
+            (
+                job
+                for job in manifest.jobs
+                if job.status == "planned"
+                and (job.representative or not representative_only)
+            ),
+            None,
+        )
+        if pending is None or self._job_id(matches[0]) != self._job_id(pending):
+            raise MediaWorkflowError("illustration_import_order_invalid")
+        try:
+            job = matches[0]
+            imported = import_image_asset(
+                job, source, manifest=manifest, ffmpeg_command=self.ffmpeg_command
             )
             updated = record_imported_image(manifest, imported)
         except Exception:
@@ -751,14 +1488,17 @@ class LocalIllustrationGateway:
 
     def unlock(self, context: StageContext) -> tuple[object, ...]:
         manifest = self._manifest(context)
+        storyboard = self._storyboard(context)
         path = context.episode_root / "media" / "illustration" / "representative_approval.json"
         try:
             approval = RepresentativeApproval.model_validate_json(path.read_text(encoding="utf-8"))
-            jobs = unlock_batch_jobs(manifest, approval)
-            unlocked = {job.scene_id: job for job in jobs}
+            jobs = unlock_batch_jobs(storyboard, manifest, approval)
+            unlocked = {self._job_id(job): job for job in jobs}
             updated = manifest.model_copy(
                 update={
-                    "jobs": tuple(unlocked.get(job.scene_id, job) for job in manifest.jobs)
+                    "jobs": tuple(
+                        unlocked.get(self._job_id(job), job) for job in manifest.jobs
+                    )
                 }
             )
             atomic_write_json(self._manifest_path(context), updated.model_dump(mode="json"))
@@ -785,6 +1525,11 @@ class LocalIllustrationGateway:
     @staticmethod
     def _manifest_path(context: StageContext) -> Path:
         return context.episode_root / "media" / "illustration" / "illustration_manifest.json"
+
+    @staticmethod
+    def _job_id(job: object) -> str:
+        asset_id = getattr(job, "asset_id", None)
+        return asset_id if isinstance(asset_id, str) else getattr(job, "scene_id")
 
 
 class LocalCoverGateway:

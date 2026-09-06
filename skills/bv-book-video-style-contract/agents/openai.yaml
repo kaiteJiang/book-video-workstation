@@ -1,0 +1,4 @@
+interface:
+  display_name: "BV 图书视频样式契约"
+  short_description: "锁定图书视频的排版、字幕和显色节奏，只替换插画画风"
+  default_prompt: "Use $bv-book-video-style-contract to restyle a BV Workstation book video without changing its approved layout, timing, subtitles, or scene semantics."

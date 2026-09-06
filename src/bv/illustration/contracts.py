@@ -11,9 +11,13 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     field_validator,
     model_validator,
+    model_serializer,
 )
+
+from bv.production.profile import VisualSequenceMode
 
 
 _SAFE_IDENTIFIER_CHARS = frozenset(
@@ -206,6 +210,12 @@ class IllustrationScene(_IllustrationModel):
     negative_constraints: tuple[str, ...]
     representative_frame: bool
     asset_status: Literal["planned", "generated", "approved"]
+    semantic_turn_span: tuple[int, int] | None = None
+    semantic_turn_ms: int | None = None
+    semantic_turn_frame: int | None = None
+    continuation_action: str | None = None
+    continuation_prompt: str | None = None
+    continuity_constraints: tuple[str, ...] | None = None
 
     @field_validator(
         "narration",
@@ -256,7 +266,33 @@ class IllustrationStoryboard(_IllustrationModel):
     character_lock_sha256: Sha256
     character_bible_sha256: Sha256 | None = None
     narrative_deviation_reason: str | None = None
+    sequence_mode: VisualSequenceMode = "legacy-monochrome-reveal"
     scenes: tuple[IllustrationScene, ...]
+
+    @model_serializer(mode="wrap")
+    def _serialize_legacy_compatibly(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> object:
+        serialized = handler(self)
+        if self.sequence_mode != "legacy-monochrome-reveal":
+            return serialized
+        if not isinstance(serialized, dict):
+            return serialized
+        serialized.pop("sequence_mode", None)
+        scenes = serialized.get("scenes")
+        if isinstance(scenes, list):
+            for scene in scenes:
+                if isinstance(scene, dict):
+                    for field in (
+                        "semantic_turn_span",
+                        "semantic_turn_ms",
+                        "semantic_turn_frame",
+                        "continuation_action",
+                        "continuation_prompt",
+                        "continuity_constraints",
+                    ):
+                        scene.pop(field, None)
+        return serialized
 
     @model_validator(mode="after")
     def _validate_timeline(self) -> IllustrationStoryboard:
@@ -274,6 +310,48 @@ class IllustrationStoryboard(_IllustrationModel):
                 raise ValueError("scene_frame_gap")
             if current.from_frame < previous.to_frame:
                 raise ValueError("scene_frame_overlap")
+        if self.sequence_mode == "color-story-pair":
+            if len(self.scenes) not in {3, 4}:
+                raise ValueError("story_pair_scene_count_invalid")
+            for scene in self.scenes:
+                required = (
+                    scene.semantic_turn_span,
+                    scene.semantic_turn_ms,
+                    scene.semantic_turn_frame,
+                    scene.continuation_action,
+                    scene.continuation_prompt,
+                    scene.continuity_constraints,
+                )
+                if (
+                    any(value is None or value == () or value == "" for value in required)
+                    or not scene.continuation_action.strip()
+                    or not scene.continuation_prompt.strip()
+                    or any(
+                        not constraint.strip()
+                        for constraint in scene.continuity_constraints
+                    )
+                ):
+                    raise ValueError("story_pair_fields_missing")
+                assert scene.semantic_turn_span is not None
+                assert scene.semantic_turn_ms is not None
+                assert scene.semantic_turn_frame is not None
+                narration_start, narration_end = scene.narration_span
+                turn_start, turn_end = scene.semantic_turn_span
+                if not (
+                    turn_start == narration_start < turn_end < narration_end
+                ):
+                    raise ValueError("invalid_semantic_turn_span")
+                if not scene.start_ms < scene.semantic_turn_ms < scene.end_ms:
+                    raise ValueError("invalid_semantic_turn_ms")
+                if scene.semantic_turn_frame != round(
+                    scene.semantic_turn_ms * self.fps / 1000
+                ):
+                    raise ValueError("semantic_turn_frame_mismatch")
+                local_turn = scene.semantic_turn_frame - scene.from_frame
+                if local_turn < 30:
+                    raise ValueError("story_pair_anchor_too_short")
+                if scene.to_frame - scene.semantic_turn_frame < 45 + 30 + 15:
+                    raise ValueError("story_pair_continuation_too_short")
         return self
 
 
@@ -283,6 +361,7 @@ class SilentRenderRequest(_IllustrationModel):
     storyboard_sha256: Sha256
     output_path: Path
     vendor_dir: Path
+    asset_sha256s: dict[str, Sha256] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

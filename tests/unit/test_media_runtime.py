@@ -5,15 +5,21 @@ from pathlib import Path
 
 import pytest
 
+import bv.workflow.media_runtime as media_runtime_module
 from bv.state.models import EpisodeState
 from bv.state.store import StateStore
 from bv.config import AppConfig
 from bv.production.profile import ProductionProfile
 from bv.delivery.exporter import ApprovalRecord, DeliveryBundle
+from bv.core.atomic import atomic_write_json
 from bv.core.hashing import sha256_file
+from bv.illustration.assets import ImageJob, IllustrationManifest
+from bv.illustration.contracts import IllustrationScene, IllustrationStoryboard
+from bv.illustration.prompts import canonical_model_sha256
 from bv.workflow.media_runtime import (
     LocalSocialCoverGateway,
     LocalDeliveryGateway,
+    LocalIllustrationGateway,
     MediaProductionService,
     MediaWorkflowError,
 )
@@ -30,10 +36,20 @@ class ArtifactStage:
     def run(self, context) -> StageOutcome:
         self.calls += 1
         self.statuses.append(context.episode_state.status)
+        if self.name == "prepare_representatives":
+            _write_fake_legacy_representative_surface(context.episode_root)
         path = context.episode_root / "media" / "stage-fixtures" / f"{self.name}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f'{{"stage":"{self.name}"}}', encoding="utf-8")
-        return StageOutcome(outputs={self.name: path}, inputs={"script_sha256": "a" * 64})
+        inputs = {"script_sha256": "a" * 64}
+        if self.name == "subtitles":
+            inputs.update(
+                {
+                    "subtitle_sequence_mode": "legacy-monochrome-reveal",
+                    "subtitle_breaks_presence": "absent",
+                }
+            )
+        return StageOutcome(outputs={self.name: path}, inputs=inputs)
 
 
 class FakeIllustrationGateway:
@@ -167,7 +183,88 @@ class FakeDeliveryGateway:
         )
 
 
-def _service(tmp_path: Path):
+def _write_fake_legacy_representative_surface(root: Path) -> None:
+    scene_ids = ("S01", "S02", "S03", "S05", "S10")
+    representatives = {"S01", "S05", "S10"}
+    scenes = tuple(
+        IllustrationScene(
+            scene_id=scene_id,
+            start_ms=index * 5_000,
+            end_ms=(index + 1) * 5_000,
+            from_frame=index * 150,
+            to_frame=(index + 1) * 150,
+            narration=f"旁白 {scene_id}",
+            narration_span=(index * 3, index * 3 + 3),
+            key_line="把生活还给自己",
+            visual_purpose="叙事",
+            setting="室内",
+            character_action="阅读",
+            metaphor=None,
+            composition="居中",
+            character_refs=(),
+            image_prompt=f"prompt {scene_id}",
+            negative_constraints=("禁止文字",),
+            representative_frame=scene_id in representatives,
+            asset_status="planned",
+        )
+        for index, scene_id in enumerate(scene_ids)
+    )
+    storyboard = IllustrationStoryboard(
+        book_id="book-demo",
+        episode_id="E001",
+        width=1080,
+        height=1920,
+        fps=30,
+        master_duration_ms=25_000,
+        total_frames=750,
+        script_sha256="a" * 64,
+        audio_sha256="b" * 64,
+        subtitle_sha256="c" * 64,
+        style_decision_sha256="d" * 64,
+        character_lock_sha256="e" * 64,
+        scenes=scenes,
+    )
+    jobs = tuple(
+        ImageJob(
+            episode_root=root,
+            scene_id=scene_id,
+            representative=scene_id in representatives,
+            prompt=f"prompt {scene_id}",
+            prompt_sha256="1" * 64,
+            style_fingerprint="2" * 64,
+            character_lock_sha256="e" * 64,
+            reference_scene_ids=(),
+            reference_image_sha256s=(),
+            output_master=(
+                root / "media" / "illustration" / "images" / f"{scene_id}_master.png"
+            ),
+            output_bw=(
+                root / "media" / "illustration" / "images" / f"{scene_id}_bw.png"
+            ),
+        )
+        for scene_id in scene_ids
+    )
+    manifest = IllustrationManifest(
+        episode_root=root,
+        book_id="book-demo",
+        episode_id="E001",
+        storyboard_sha256=canonical_model_sha256(storyboard),
+        style_fingerprint="2" * 64,
+        character_lock_sha256="e" * 64,
+        jobs=jobs,
+    )
+    illustration = root / "media" / "illustration"
+    atomic_write_json(
+        illustration / "illustration_storyboard.json",
+        storyboard.model_dump(mode="json"),
+    )
+    atomic_write_json(
+        illustration / "illustration_manifest.json",
+        manifest.model_dump(mode="json"),
+    )
+
+
+def _service(tmp_path: Path, *, book_menu_refresher=None):
     workspace = tmp_path / "workspace"
     root = workspace / "books" / "book-demo" / "episodes" / "E001"
     root.mkdir(parents=True)
@@ -194,6 +291,7 @@ def _service(tmp_path: Path):
         cover=FakeCoverGateway(),
         social_cover=social_cover,
         delivery=FakeDeliveryGateway(),
+        book_menu_refresher=book_menu_refresher,
     ), gateway, stages
 
 
@@ -266,6 +364,18 @@ def test_prepare_is_idempotent_for_current_stage_manifests(tmp_path: Path) -> No
 
 
 def test_runtime_builder_uses_codex_handdrawn_stages_without_grok(tmp_path: Path) -> None:
+    catalog = (
+        tmp_path
+        / "vendor"
+        / "references"
+        / "handdrawn-style-library.json"
+    )
+    catalog.parent.mkdir(parents=True)
+    catalog.write_bytes(
+        Path(
+            "vendor/story_to_handdrawn_video/references/handdrawn-style-library.json"
+        ).read_bytes()
+    )
     config = AppConfig(
         workspace_dir=tmp_path / "workspace",
         voice_path=tmp_path / "voice.wav",
@@ -287,6 +397,7 @@ def test_runtime_builder_uses_codex_handdrawn_stages_without_grok(tmp_path: Path
     assert bindings.service.stages == dict(bindings.stages)
     assert isinstance(bindings.service.social_cover, LocalSocialCoverGateway)
     assert isinstance(bindings.service.delivery, LocalDeliveryGateway)
+    assert callable(bindings.service.book_menu_refresher)
     assert bindings.gate_approvers == {}
     assert bindings.stages["tts"].mode == "technical_sample"
     with pytest.raises(MediaWorkflowError, match="media_runtime_mode_mismatch"):
@@ -330,7 +441,13 @@ def test_mode_switch_archives_sample_media_before_full_rebuild(tmp_path: Path) -
 
 
 def test_final_render_allows_no_product_cover_and_stops_at_final_review(tmp_path: Path) -> None:
-    service, _, _ = _service(tmp_path)
+    refreshed_statuses: list[str] = []
+    service, _, _ = _service(
+        tmp_path,
+        book_menu_refresher=lambda: refreshed_statuses.append(
+            service.store.load_episode("book-demo", "E001").status
+        ),
+    )
     image = tmp_path / "generated.png"
     image.write_bytes(b"fixture")
     view = service.prepare("book-demo", "E001", mode="full")
@@ -369,3 +486,113 @@ def test_final_render_allows_no_product_cover_and_stops_at_final_review(tmp_path
     assert approved.status == "final_approved"
     assert approved.approval_record_path is not None
     assert approved.approval_record_path.is_file()
+    assert refreshed_statuses == ["final_approved"]
+
+
+def test_local_pair_status_uses_asset_ids_for_each_anchor_and_continuation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace" / "books" / "book-demo" / "episodes" / "E001"
+    illustration_root = root / "media" / "illustration"
+    illustration_root.mkdir(parents=True)
+    jobs = tuple(
+        ImageJob(
+            episode_root=root,
+            scene_id="S01",
+            representative=True,
+            prompt=f"prompt-{asset_id}",
+            prompt_sha256="a" * 64,
+            style_fingerprint="b" * 64,
+            character_lock_sha256="c" * 64,
+            reference_scene_ids=("S01",) if phase == "continuation" else (),
+            reference_image_sha256s=(),
+            phase=phase,
+            asset_id=asset_id,
+            output_master=root / "media" / "illustration" / "images" / f"S01_{phase}.png",
+            status=status,
+        )
+        for phase, asset_id, status in (
+            ("anchor", "S01-A", "generated"),
+            ("continuation", "S01-B", "planned"),
+        )
+    )
+    manifest = IllustrationManifest(
+        episode_root=root,
+        book_id="book-demo",
+        episode_id="E001",
+        storyboard_sha256="d" * 64,
+        style_fingerprint="b" * 64,
+        character_lock_sha256="c" * 64,
+        jobs=jobs,
+    )
+    (illustration_root / "illustration_manifest.json").write_text(
+        manifest.model_dump_json(), encoding="utf-8"
+    )
+    episode = EpisodeState(book_id="book-demo", episode_id="E001")
+    context = type("Context", (), {"episode_root": root, "book_id": "book-demo", "episode_id": "E001", "episode_state": episode})()
+
+    present, missing = LocalIllustrationGateway(ffmpeg_command="ffmpeg").status(context)
+
+    assert present == ("S01-A",)
+    assert missing == ("S01-B",)
+
+
+def test_local_pair_import_rejects_out_of_order_asset_without_orphan_and_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace" / "books" / "book-demo" / "episodes" / "E001"
+    illustration_root = root / "media" / "illustration"
+    illustration_root.mkdir(parents=True)
+    jobs = tuple(
+        ImageJob(
+            episode_root=root, scene_id=scene_id,
+            representative=scene_id in {"S01", "S03", "S04"},
+            prompt=f"prompt-{asset_id}", prompt_sha256="a" * 64,
+            style_fingerprint="b" * 64, character_lock_sha256="c" * 64,
+            reference_scene_ids=(scene_id,) if phase == "continuation" else (),
+            reference_image_sha256s=(), phase=phase, asset_id=asset_id,
+            output_master=root / "media" / "illustration" / "images" / f"{scene_id}_{phase}.png",
+            status="generated" if scene_id == "S01" else "planned",
+        )
+        for scene_id in ("S01", "S03", "S04", "S02")
+        for phase, asset_id in (("anchor", f"{scene_id}-A"), ("continuation", f"{scene_id}-B"))
+    )
+    manifest = IllustrationManifest(
+        episode_root=root, book_id="book-demo", episode_id="E001",
+        storyboard_sha256="d" * 64, style_fingerprint="b" * 64,
+        character_lock_sha256="c" * 64, jobs=jobs,
+    )
+    (illustration_root / "illustration_manifest.json").write_text(
+        manifest.model_dump_json(), encoding="utf-8"
+    )
+    context = type("Context", (), {"episode_root": root, "book_id": "book-demo", "episode_id": "E001"})()
+    gateway = LocalIllustrationGateway(ffmpeg_command="ffmpeg")
+    source = tmp_path / "generated.png"
+    source.write_bytes(b"fixture")
+
+    with pytest.raises(MediaWorkflowError, match="illustration_import_order_invalid"):
+        gateway.import_master(context, "S04-A", source, representative_only=True)
+    assert not (root / "media" / "illustration" / "images" / "S04_anchor.png").exists()
+
+    imported_asset_ids: list[str] = []
+    monkeypatch.setattr(
+        media_runtime_module,
+        "import_image_asset",
+        lambda job, _source, **_kwargs: imported_asset_ids.append(job.asset_id) or object(),
+    )
+    monkeypatch.setattr(
+        media_runtime_module,
+        "record_imported_image",
+        lambda current, _imported: current.model_copy(
+            update={
+                "jobs": tuple(
+                    job.model_copy(update={"status": "generated"}) if job.asset_id == "S03-A" else job
+                    for job in current.jobs
+                )
+            }
+        ),
+    )
+    gateway.import_master(context, "S03-A", source, representative_only=True)
+
+    assert imported_asset_ids == ["S03-A"]

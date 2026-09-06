@@ -73,6 +73,7 @@ def test_cli_new_title_author_creates_project_and_prints_created(
     assert profile.duration.hard_min_seconds == 30.0
     assert profile.duration.hard_max_seconds == 45.0
     assert profile.visual.scene_count == 4
+    assert profile.visual.sequence_mode == "color-story-pair"
     assert profile.visual.style_id == "retro-gouache-concept"
 
 
