@@ -4,11 +4,19 @@ from typing import Optional
 import typer
 
 from bv.books.service import create_book_from_metadata, import_book
+from bv.content.story import (
+    StoryEvidence,
+    StoryFactualReview,
+    StoryMetadata,
+    StorySection,
+    import_story_candidate,
+)
 from bv.config import AppConfig, load_config
 from bv.state.store import StateStore
 from bv.workflow.doctor import render_doctor_report, run_doctor
 from bv.workflow.orchestrator import Orchestrator, WorkflowError, WorkflowView
 from bv.workflow.runtime import RuntimeAuthorization, build_runtime_bindings
+from bv.voice.catalog import load_voice_catalog, select_story_voices
 
 
 app = typer.Typer(no_args_is_help=True, help="BV Workstation")
@@ -140,6 +148,72 @@ def next_command(
         RuntimeAuthorization(allow_external=allow_external),
     )
     _render_view(_workflow_call(lambda: workflow.next(book_id, episode_id)))
+
+
+@app.command("import-story")
+def import_story(
+    book_id: str,
+    episode_id: str,
+    story_file: Path,
+    contract_file: Path,
+    candidate_name: str = typer.Option("candidate.txt", "--candidate-name"),
+) -> None:
+    """Import a directly authored, evidence-bound story as a review candidate."""
+    try:
+        text = story_file.read_text(encoding="utf-8")
+        import json
+
+        contract = json.loads(contract_file.read_text(encoding="utf-8"))
+        result = import_story_candidate(
+            store=StateStore(load_config_default().workspace_dir),
+            book_id=book_id,
+            episode_id=episode_id,
+            text=text,
+            metadata=StoryMetadata.model_validate(contract["metadata"]),
+            evidence=[StoryEvidence.model_validate(item) for item in contract["evidence"]],
+            sections=[StorySection.model_validate(item) for item in contract["sections"]],
+            factual_review=StoryFactualReview.model_validate(contract["factual_review"]),
+            candidate_filename=candidate_name,
+        )
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=2) from None
+    typer.echo("Status: awaiting_script_review")
+    typer.echo(f"Candidate: {result.candidate_path}")
+    typer.echo(f"Manifest: {result.manifest_path}")
+    typer.echo(f"Warnings: {', '.join(result.warnings) or 'none'}")
+    typer.echo(f"Next: bv approve {book_id} {episode_id} script")
+
+
+@app.command("voice-pool")
+def voice_pool(
+    gender: str = typer.Option("any", "--gender"),
+    tag: list[str] = typer.Option([], "--tag"),
+) -> None:
+    """List up to three catalog candidates without probing or synthesizing."""
+    normalized_gender = gender.strip().lower()
+    if normalized_gender not in {"male", "female", "any"}:
+        typer.echo("Error: voice_gender_invalid")
+        raise typer.Exit(code=2)
+    try:
+        selections = select_story_voices(
+            load_voice_catalog(),
+            narrator_gender=normalized_gender,
+            desired_story_tags=tuple(tag or ["natural"]),
+            limit=3,
+        )
+    except Exception as exc:
+        typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=2) from None
+    if not selections:
+        typer.echo("No matching voices")
+        return
+    for selection in selections:
+        typer.echo(f"Name: {selection.voice.display_name}")
+        typer.echo(f"Voice ID: {selection.voice.voice_id}")
+        typer.echo(f"Reasons: {'; '.join(selection.reasons)}")
+        typer.echo(f"Audition: {selection.voice.audition_status}")
+        typer.echo("Live availability: unknown")
 
 
 @app.command()

@@ -2,14 +2,14 @@
 
 # 📚 BV Workstation
 
-### 把一本书，稳稳地交给 Agent 做成一条短视频
+### 从一本书里，讲好一个值得听完的故事
 
 本地优先 · 人工门禁 · 可追溯清单 · 中文图书视频工作台
 
 [![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white)](#环境要求)
 [![MIT License](https://img.shields.io/badge/License-MIT-22C55E?style=for-the-badge)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1196%20passed-8B5CF6?style=for-the-badge)](#开发与验证)
+[![Tests](https://img.shields.io/badge/tests-local%20verification-8B5CF6?style=for-the-badge)](#开发与验证)
 [![Video](https://img.shields.io/badge/video-1080%C3%971920%20%40%2030fps-FF4D6D?style=for-the-badge)](#默认成片规格)
 
 [🚀 五分钟上手](#五分钟上手) · [🧭 生产流程](#一条视频是怎么跑出来的) · [🤖 交给 Agent](#直接交给-agent) · [🧑‍🏫 小白复刻教程](docs/agent-rebuild-guide.zh-CN.md)
@@ -18,7 +18,9 @@
 
 ---
 
-BV Workstation 是一个面向 Windows 的开源图书视频生产底座。它接收书名加作者，或一份合法可读的 TXT、PDF、EPUB 文件，在 Agent 对话中完成书籍理解、口播文稿、配音、字幕、四张背景图、竖屏渲染、独立封面和最终验收。
+BV Workstation 是一个面向 Windows 的图书故事视频工作台。它接收书名加作者，或一份合法可读的 TXT、PDF、EPUB 文件，在 Agent 对话中完成来源核验、人物视角长稿、音色筛选、配音、字幕、成对连续画面、竖屏渲染、独立封面和最终验收。
+
+当前创作路线见 [长篇故事生产手册](docs/runbooks/longform-story-production.md)。Agent 总入口为 [图书视频生产 Skill](skills/producing-book-handdrawn-videos/SKILL.md)，故事小节和视觉规格由两个专项 Skill 维护。文稿按故事完整性决定长度，常用预算 6–8 分钟，10 分钟为软提醒；声音从候选池中按故事筛选，AB 套图按语义节点增加。文稿直接写作，不依赖去 AI 味 Skill。旧短视频模式保留兼容。
 
 它没有假装一条命令就能替你做完所有判断。文稿、音色、代表图和成片都有明确停点，只有得到批准，流水线才会继续消耗下一阶段的资源。
 
@@ -30,7 +32,7 @@ BV Workstation 是一个面向 Windows 的开源图书视频生产底座。它�
 
 ### 🧠 整本书理解
 
-标题作者模式会先建立书籍身份和证据边界。文稿围绕读者价值，不从零散金句硬凑观点。
+标题作者模式会先建立书籍身份和证据边界。文稿围绕一个核心故事，以事件、冲突、应对和结果推进。
 
 </td>
 <td width="33%" valign="top">
@@ -58,9 +60,9 @@ BV Workstation 是一个面向 Windows 的开源图书视频生产底座。它�
 </td>
 <td width="33%" valign="top">
 
-### 🎨 四图手绘叙事
+### 🎨 连续 AB 叙事
 
-新建短视频固定四张背景图，先看开头、中段、结尾三张代表图，批准后只补最后一张。
+按故事安排多组 AB 画面，每组从初始处境走到经历剧情发展后的高潮或结果。先审三组完整代表图，再补齐其他组；最终配音与 ASR 决定转折时间。
 
 </td>
 <td width="33%" valign="top">
@@ -77,16 +79,16 @@ BV Workstation 是一个面向 Windows 的开源图书视频生产底座。它�
 
 ```mermaid
 flowchart LR
-    A[书名和作者<br/>或合法书籍文件] --> B[身份与证据边界]
-    B --> C[整书价值文稿]
+    A[书名和作者<br/>或合法书籍文件] --> B[身份与关键故事证据]
+    B --> C[人物视角长稿与 AB 小节计划]
     C --> D{文稿批准}
     D -->|通过| E[同片段音色试听]
     E --> F{音色批准}
     F -->|通过| G[正式旁白和 ASR]
-    G --> H[四场景分镜]
-    H --> I[三张代表图]
+    G --> H[将 AB 小节绑定实际 ASR]
+    H --> I[三组完整代表图]
     I --> J{代表图批准}
-    J -->|通过| K[补齐第四张图]
+    J -->|通过| K[补齐其余 AB]
     K --> L[竖屏渲染与 QC]
     L --> M[独立 3:4 封面]
     M --> N{最终人工确认}
@@ -95,7 +97,11 @@ flowchart LR
 
 > 外部服务调用需要当前请求的明确授权。任何阶段失败都会停在原地，不自动换供应商，也不把失败伪装成完成。
 
-## 默认成片规格
+## 成片规格与旧模式兼容
+
+长篇故事以 `ProductionProfile.longform_story_default()` 为配置，使用动态 AB 数量、十分钟软提醒和直接写作文稿门禁。`bv import-story --help` 查看候选登记入口；`bv voice-pool --help` 查看只读音色筛选入口。候选音色尚待实际试听，不代表热度排名或账户可用性已经核验。
+
+以下为保留兼容的旧短视频配置：
 
 | 项目 | 新建标题作者短视频 |
 | --- | --- |
@@ -177,13 +183,15 @@ uv run bv next <book_id>
 把下面这段连同仓库地址交给你的 Agent：
 
 ```text
-请接手这个图书视频项目。先读 README、config.example.yaml 和
-docs/runbooks/handdrawn-codex-production.md，再运行只读的环境检查与项目状态检查。
+请接手这个图书视频项目。先读 AGENTS.md、README、config.example.yaml 和
+docs/runbooks/longform-story-production.md，再运行只读的环境检查与项目状态检查。
 不要打印或提交任何密钥、Cookie、电子书正文、私人笔记和供应商原始响应。
 
 输入是书名加作者，或我有权使用的 TXT、PDF、EPUB 文件。
-严格按门禁推进：先给我确认文稿，再做同片段音色试听，再做三张代表图，
-批准后补齐总计四张背景图，最后渲染 30–45 秒竖屏视频和 3:4 独立封面。
+用第一视角优先的直接写作方式，讲透一个最值得说的故事，不使用去 AI 味 Skill。
+严格按门禁推进：先给我确认完整长稿，再做同片段音色试听，再做三组完整 AB 代表图，
+批准后按语义补齐其余 AB，最后渲染竖屏视频和 3:4 独立封面。
+长度由故事决定，常用 6–8 分钟，优先控制在 10 分钟内，不凑时长。
 画风固定使用第 11 种 retro-gouache-concept。
 每次准备调用外部服务前，说明服务、输入、预计产物和是否可能收费，等我批准。
 没有真实媒体、清单、探测结果和 QC 报告时，不要声称已经完成。

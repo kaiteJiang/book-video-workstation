@@ -62,12 +62,14 @@ def compile_image_prompt(
     style_blocks = "\n".join(f"- {item}" for item in style.prompt_blocks)
     phase_instructions = ""
     if phase == "anchor":
-        phase_instructions = "\n剧情对阶段：A（锚点图）。呈现转折前已经发生的动作。\n"
+        phase_instructions = "\n剧情对阶段：A（故事起点）。建立本叙事小节开始时的人物处境与悬念，不提前显示小节结果。\n"
     elif phase == "continuation":
         phase_instructions = (
-            "\n剧情对阶段：B（延续图）。必须以第一张参考图延续人物、服装、场所、"
-            "镜头方向、道具和画风；仅推进旁白支持的一个动作。\n"
-            f"延续动作：{scene.continuation_action}\n"
+            "\n剧情对阶段：B（小节高潮或结果）。第一张参考图用于人物身份和画风连续性，"
+            "不是必须复制的镜头。按本小节已经讲出的事件发展呈现改变后的处境；"
+            "时间、地点、年龄、服饰、机位及在场人物可依据正文改变。"
+            "不得只改手势、表情或道具位置充当故事发展。\n"
+            f"结果或新处境：{scene.continuation_action}\n"
             f"延续画面：{scene.continuation_prompt}\n"
             f"连续性约束：{'；'.join(scene.continuity_constraints or ())}\n"
         )

@@ -52,7 +52,7 @@ def _scene(index: int) -> IllustrationScene:
     )
 
 
-def _episode_fixture(tmp_path: Path) -> tuple[Path, EpisodeState, IllustrationStoryboard, CharacterBible]:
+def _episode_fixture(tmp_path: Path, *, scene_count: int = 4) -> tuple[Path, EpisodeState, IllustrationStoryboard, CharacterBible]:
     root = tmp_path / "books" / "book-demo" / "episodes" / "E001"
     illustration = root / "media" / "illustration"
     images = illustration / "images"
@@ -74,12 +74,12 @@ def _episode_fixture(tmp_path: Path) -> tuple[Path, EpisodeState, IllustrationSt
     bible = CharacterBible(source_script_sha256="a" * 64, style_fingerprint="b" * 64, characters=(character,))
     storyboard = IllustrationStoryboard(
         book_id="book-demo", episode_id="E001", width=1080, height=1920, fps=30,
-        master_duration_ms=20_000, total_frames=600, script_sha256="a" * 64,
+        master_duration_ms=scene_count * 5_000, total_frames=scene_count * 150, script_sha256="a" * 64,
         audio_sha256="c" * 64, subtitle_sha256="d" * 64,
         style_decision_sha256=canonical_model_sha256(old_style),
         character_lock_sha256=canonical_model_sha256(bible),
         character_bible_sha256=canonical_model_sha256(bible),
-        sequence_mode="color-story-pair", scenes=tuple(_scene(index) for index in range(4)),
+        sequence_mode="color-story-pair", scenes=tuple(_scene(index).model_copy(update={"representative_frame": index in {0, scene_count // 2, scene_count - 1}}) for index in range(scene_count)),
     )
     style = next(item for item in load_style_catalog(CATALOG) if item.style_id == old_style.selected_style)
     manifest = prepare_image_jobs(storyboard, bible, style, old_style, root)
@@ -399,3 +399,24 @@ def test_restyle_rejects_social_cover_parent_junction_without_touching_outside(t
         )
 
     assert (outside / "cover.png").read_bytes() == b"outside cover"
+
+
+@pytest.mark.parametrize("scene_count", [16, 30])
+def test_dynamic_story_restyle_retains_all_pairs(tmp_path: Path, scene_count: int) -> None:
+    root, episode, old_storyboard, _ = _episode_fixture(tmp_path, scene_count=scene_count)
+    result = restyle_illustrations(episode=episode, episode_root=root, catalog_path=CATALOG, requested_style_id="warm-flat-storybook")
+    manifest = IllustrationManifest.model_validate_json((root / "media/illustration/illustration_manifest.json").read_text(encoding="utf-8"))
+    storyboard = IllustrationStoryboard.model_validate_json((root / "media/illustration/illustration_storyboard.json").read_text(encoding="utf-8"))
+    assert len(manifest.jobs) == scene_count * 2
+    assert _semantic(storyboard) == _semantic(old_storyboard)
+    assert len(result.missing_asset_ids) == 6
+    episode.status = "representative_generation_running"
+    recovered = restyle_module.validate_restyle_provenance(
+        episode=episode, episode_root=root, catalog_path=CATALOG,
+        expected_override_sha256=result.override_sha256,
+        expected_requested_style_id=result.selected_style,
+        expected_style_fingerprint=result.style_fingerprint,
+        expected_catalog_sha256=result.catalog_sha256,
+        expected_plan_sha256=result.plan_sha256,
+    )
+    assert len(recovered.storyboard.scenes) == scene_count

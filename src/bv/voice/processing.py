@@ -137,6 +137,7 @@ class NarrationDurationPolicy:
     ideal_min_seconds: float
     ideal_max_seconds: float
     hard_max_seconds: float
+    advisory_only: bool = False
 
 
 TECHNICAL_SAMPLE_POLICY = NarrationDurationPolicy(10.0, 13.0, 17.0, 20.0)
@@ -149,6 +150,7 @@ def duration_policy_from(profile: DurationProfile) -> NarrationDurationPolicy:
         ideal_min_seconds=profile.ideal_min_seconds,
         ideal_max_seconds=profile.ideal_max_seconds,
         hard_max_seconds=profile.hard_max_seconds,
+        advisory_only=profile.advisory_only,
     )
 
 
@@ -162,7 +164,7 @@ def classify_narration_duration(
         <= policy.ideal_max_seconds <= policy.hard_max_seconds
     ):
         raise VoiceProcessingError("invalid_duration_policy")
-    if seconds < policy.hard_min_seconds:
+    if seconds < policy.hard_min_seconds and not policy.advisory_only:
         return NarrationDuration(seconds=seconds, level="fail", band="too_short")
     if seconds < policy.ideal_min_seconds:
         return NarrationDuration(seconds=seconds, level="pass", band="edge_short", warnings=["edge_short_duration"])
@@ -170,6 +172,8 @@ def classify_narration_duration(
         return NarrationDuration(seconds=seconds, level="pass", band="ideal")
     if seconds <= policy.hard_max_seconds:
         return NarrationDuration(seconds=seconds, level="pass", band="edge_long", warnings=["edge_long_duration"])
+    if policy.advisory_only:
+        return NarrationDuration(seconds=seconds, level="pass", band="edge_long", warnings=["duration_above_soft_max"])
     return NarrationDuration(seconds=seconds, level="fail", band="too_long")
 
 
@@ -470,6 +474,8 @@ def _duration_tempo_factor(
     max_tempo_factor: float = 1.08,
     target_margin_seconds: float = 0.25,
 ) -> float:
+    if policy.advisory_only:
+        return 1.0
     if seconds <= policy.hard_max_seconds:
         return 1.0
     target = policy.hard_max_seconds - target_margin_seconds

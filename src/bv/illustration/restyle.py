@@ -143,7 +143,7 @@ def restyle_illustrations(
         manifest = prepare_image_jobs(storyboard, bible, style, decision, root)
     except Exception:
         raise IllustrationRestyleError("restyle_manifest_invalid") from None
-    if len(manifest.jobs) not in {6, 8} or any(
+    if not 6 <= len(manifest.jobs) <= 96 or any(
         job.status != "planned"
         or job.master_sha256 is not None
         or job.anchor_sha256 is not None
@@ -793,7 +793,7 @@ def _validate_original_plan_provenance(
             or manifest.style_fingerprint != decision.style_fingerprint
             or manifest.character_lock_sha256 != canonical_model_sha256(bible)
             or len(manifest.jobs) != len(storyboard.scenes) * 2
-            or len(manifest.jobs) not in {6, 8}
+            or not 6 <= len(manifest.jobs) <= 96
             or prepare_stage.inputs.get("storyboard_sha256")
             != manifest.storyboard_sha256
             or prepare_stage.inputs.get("style_fingerprint")
@@ -896,7 +896,7 @@ def validate_restyle_provenance(
         or manifest.episode_id != episode.episode_id
         or manifest.episode_root != root.absolute()
         or len(manifest.jobs) != len(storyboard.scenes) * 2
-        or len(manifest.jobs) not in {6, 8}
+        or not 6 <= len(manifest.jobs) <= 96
         or restyle_plan_sha256(storyboard, manifest) != expected_plan_sha256
     ):
         raise IllustrationRestyleError("restyle_provenance_invalid")
@@ -958,11 +958,12 @@ def _validate_pair_manifest_lifecycle(
     representative_scene_ids = tuple(
         scene.scene_id for scene in storyboard.scenes if scene.representative_frame
     )
-    if len(scene_ids) == 3:
-        expected_representatives = scene_ids
-    elif len(scene_ids) == 4:
-        expected_representatives = (scene_ids[0], scene_ids[2], scene_ids[3])
-    else:
+    if not 3 <= len(scene_ids) <= 48:
+        raise ValueError
+    expected_representatives = tuple(
+        scene.scene_id for scene in storyboard.scenes if scene.representative_frame
+    )
+    if len(expected_representatives) != 3:
         raise ValueError
     if representative_scene_ids != expected_representatives:
         raise ValueError

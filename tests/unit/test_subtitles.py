@@ -313,11 +313,11 @@ def test_render_ass_uses_live_template_safe_area_and_single_line_punctuation_fre
     assert rendered.startswith("[Script Info]\n")
     assert "BV_TASK17_SUBTITLE_TEMPLATE_V1" in rendered
     assert "PlayResX: 1080" in rendered and "PlayResY: 1920" in rendered
-    assert "Alignment,2" in rendered and "MarginV,220" in rendered
+    assert "Alignment,2" in rendered and "MarginV,420" in rendered
     assert "Test Subtitle Font" in rendered
     assert (
         "Style: BV_Task17_Default,Test Subtitle Font,68,&H00FFFFFF,"
-        "&H000000FF,&H00101010,&HFF000000,-1,0,0,0,100,100,0,0,1,5,0,2,84,84,220,1"
+        "&H000000FF,&H00101010,&HFF000000,-1,0,0,0,100,100,0,0,1,5,0,2,84,84,420,1"
         in rendered
     )
     assert "0:00:00.00,0:00:00.61" in rendered

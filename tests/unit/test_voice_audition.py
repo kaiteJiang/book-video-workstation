@@ -15,6 +15,7 @@ from bv.voice.audition import (
     VoiceAuditionService,
     VoiceProfile,
     require_current_voice_profile,
+    select_audition_excerpt,
 )
 from bv.voice.providers import NarrationArtifact, NarrationRequest, ProviderReceipt
 from bv.workflow.runtime import RuntimeAuthorization
@@ -153,6 +154,106 @@ def test_audition_uses_same_excerpt_and_at_most_three_candidates(
         )
 
 
+class FailOnceDoubaoSynthesizer(FakeDoubaoSynthesizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next = True
+
+    def synthesize(
+        self,
+        request: NarrationRequest,
+        authorization: RuntimeAuthorization,
+    ) -> NarrationArtifact:
+        if self.fail_next:
+            self.fail_next = False
+            raise VoiceAuditionError("fixture_interrupted")
+        return super().synthesize(request, authorization)
+
+
+def test_supplied_non_opening_excerpt_preserves_exact_approved_boundaries() -> None:
+    opening = "开头只是背景，不适合判断整篇旁白的情绪。\n\n"
+    peak = (
+        "直到那封信被重新打开，他才发现多年的误会并没有消失，只是一直被每个人藏在沉默里。"
+        "纸上的日期和名字，把所有人不愿面对的那段往事重新带回眼前。"
+    )
+    tail = "后来的人生仍在继续。"
+    script = opening + peak + tail
+    span = (len(opening), len(opening) + len(peak))
+
+    excerpt, actual_span = select_audition_excerpt(
+        script,
+        speed=1.0,
+        excerpt_span=span,
+    )
+
+    assert actual_span == span
+    assert excerpt == script[span[0]:span[1]]
+    assert hashlib.sha256(excerpt.encode("utf-8")).hexdigest() == hashlib.sha256(
+        script[span[0]:span[1]].encode("utf-8")
+    ).hexdigest()
+
+
+def test_semantic_excerpt_prefers_non_opening_narrative_peak() -> None:
+    opening = "这是一个平静的开头，用来介绍人物和故事发生的地方。\n\n"
+    bridge = "日子一天天过去，所有人都以为生活会照旧继续下去。\n\n"
+    peak = (
+        "但是直到真相突然出现，他终于发现，原来那次离开不是背叛，而是一个人决定独自承担后果。"
+        "那些多年没有答案的问题，也在这一刻改变了每个人后来的人生。"
+    )
+    script = opening + bridge + peak
+
+    excerpt, span = select_audition_excerpt(script, speed=1.0)
+
+    assert span[0] == len(opening) + len(bridge)
+    assert excerpt == script[span[0]:span[1]]
+
+
+def test_story_profile_defaults_to_non_opening_narrative_peak(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    opening = "这是一个平静的开头，用来介绍人物和故事发生的地方。\n\n"
+    bridge = "日子一天天过去，所有人都以为生活会照旧继续下去。\n\n"
+    peak = (
+        "但是直到真相突然出现，他终于发现，原来那次离开不是背叛，而是一个人决定独自承担后果。"
+        "那些多年没有答案的问题，也在这一刻改变了每个人后来的人生。"
+    )
+    script_path = context.episode_root / "script" / "approved.txt"
+    script_path.write_text(opening + bridge + peak, encoding="utf-8")
+    profile = ProductionProfile.longform_story_default()
+    (context.episode_root / "production_profile.json").write_text(
+        profile.model_dump_json(indent=2), encoding="utf-8"
+    )
+    context = StageContext(
+        book_id=context.book_id,
+        episode_id=context.episode_id,
+        episode_root=context.episode_root,
+        episode_state=context.episode_state.model_copy(update={"script_hash": _sha256(script_path)}),
+    )
+    synth = FakeDoubaoSynthesizer()
+    voices = ("voice-a",)
+
+    manifest = VoiceAuditionService(
+        synthesizers={"doubao": synth},
+        now=lambda: datetime(2026, 8, 23, tzinfo=UTC),
+    ).prepare_candidates(
+        context,
+        voice_ids=voices,
+        supported_voice_ids=voices,
+        authorization=_authorization(context, voices),
+    )
+
+    approved_text = script_path.read_bytes().decode("utf-8")
+    assert manifest.excerpt_span[0] == approved_text.index(peak)
+
+
+def test_supplied_excerpt_rejects_out_of_bounds_or_too_short_span() -> None:
+    text = "这是批准后的完整文稿。" * 20
+
+    with pytest.raises(VoiceAuditionError, match="voice_audition_excerpt_span_invalid"):
+        select_audition_excerpt(text, speed=1.0, excerpt_span=(4, len(text) + 1))
+    with pytest.raises(VoiceAuditionError, match="voice_audition_excerpt_invalid"):
+        select_audition_excerpt(text, speed=1.0, excerpt_span=(0, 5))
+
+
 def test_approval_updates_profile_and_creates_current_voice_evidence(
     tmp_path: Path,
 ) -> None:
@@ -260,3 +361,44 @@ def test_completed_audition_is_idempotent_without_new_submissions(
 
     assert second == first
     assert len(synth.requests) == 1
+    assert first.excerpt_span[0] == 0
+    assert (context.episode_root / first.excerpt_path).read_text(encoding="utf-8").startswith(
+        "有些人读活着"
+    )
+
+
+def test_interrupted_legacy_request_root_resumes_with_opening_excerpt(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    synth = FailOnceDoubaoSynthesizer()
+    voices = ("voice-a",)
+    service = VoiceAuditionService(
+        synthesizers={"doubao": synth},
+        now=lambda: datetime(2026, 8, 23, tzinfo=UTC),
+    )
+
+    with pytest.raises(VoiceAuditionError, match="fixture_interrupted"):
+        service.prepare_candidates(
+            context,
+            voice_ids=voices,
+            supported_voice_ids=voices,
+            authorization=_authorization(context, voices),
+        )
+
+    request_root = (
+        context.episode_root / ".private" / "candidates" / "tts-audition-20260823"
+    )
+    assert (request_root / "request.json").is_file()
+    assert (request_root / "excerpt.txt").read_text(encoding="utf-8").startswith(
+        "有些人读活着"
+    )
+
+    manifest = service.prepare_candidates(
+        context,
+        voice_ids=voices,
+        supported_voice_ids=voices,
+        authorization=_authorization(context, voices),
+    )
+
+    assert manifest.excerpt_span[0] == 0

@@ -27,6 +27,10 @@ _MAX_REQUEST_BYTES = 28 * 1_024 * 1_024
 _MAX_RESPONSE_BYTES = 4 * 1_024 * 1_024
 _MIN_MASTER_DURATION_MS = 30_000
 _MAX_MASTER_DURATION_MS = 150_000
+# Official flash limits: https://www.volcengine.com/docs/6561/1631584
+_LONGFORM_MAX_AUDIO_BYTES = 100_000_000
+_LONGFORM_MAX_REQUEST_BYTES = 134_000_000
+_LONGFORM_MAX_DURATION_MS = 2 * 60 * 60 * 1_000
 
 
 class VolcengineAsrError(RuntimeError):
@@ -52,6 +56,7 @@ class FlashRequest(BaseModel):
     audio_sha256: str
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     endpoint: str = _FLASH_ENDPOINT
+    longform: bool = False
 
 
 class WordTiming(BaseModel):
@@ -124,7 +129,8 @@ def _build_flash_payload(request: FlashRequest) -> tuple[bytes, int]:
         "request": {"model_name": "bigmodel"},
     }
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(body) > _MAX_REQUEST_BYTES:
+    request_limit = _LONGFORM_MAX_REQUEST_BYTES if request.longform else _MAX_REQUEST_BYTES
+    if len(body) > request_limit:
         raise VolcengineAsrError("asr_request_too_large")
     return body, duration_ms
 
@@ -239,7 +245,8 @@ def _read_master_snapshot(request: FlashRequest) -> tuple[bytes, int]:
         raise VolcengineAsrError("unsafe_master_audio")
     if not _is_sha256(request.audio_sha256):
         raise VolcengineAsrError("master_hash_mismatch")
-    audio_bytes = _read_bounded_file(path, _MAX_AUDIO_BYTES, "master_audio_too_large")
+    audio_limit = _LONGFORM_MAX_AUDIO_BYTES if request.longform else _MAX_AUDIO_BYTES
+    audio_bytes = _read_bounded_file(path, audio_limit, "master_audio_too_large")
     if hashlib.sha256(audio_bytes).hexdigest() != request.audio_sha256:
         raise VolcengineAsrError("master_hash_mismatch")
     try:
@@ -254,7 +261,9 @@ def _read_master_snapshot(request: FlashRequest) -> tuple[bytes, int]:
             sample_rate = stream.getframerate()
             if not (
                 frame_count * 1_000 >= _MIN_MASTER_DURATION_MS * sample_rate
-                and frame_count * 1_000 <= _MAX_MASTER_DURATION_MS * sample_rate
+                and frame_count * 1_000 <= (
+                    _LONGFORM_MAX_DURATION_MS if request.longform else _MAX_MASTER_DURATION_MS
+                ) * sample_rate
             ):
                 raise VolcengineAsrError("invalid_master_audio")
             duration_ms = round(frame_count * 1_000 / sample_rate)
@@ -278,7 +287,8 @@ def _read_bounded_file(path: Path, max_bytes: int, error_code: str) -> bytes:
 
 def _recheck_master_hash(request: FlashRequest) -> None:
     try:
-        current = _read_bounded_file(Path(request.audio_path), _MAX_AUDIO_BYTES, "master_hash_changed")
+        audio_limit = _LONGFORM_MAX_AUDIO_BYTES if request.longform else _MAX_AUDIO_BYTES
+        current = _read_bounded_file(Path(request.audio_path), audio_limit, "master_hash_changed")
     except VolcengineAsrError:
         raise VolcengineAsrError("master_hash_changed") from None
     if hashlib.sha256(current).hexdigest() != request.audio_sha256:

@@ -206,8 +206,19 @@ def test_equivalent_chinese_and_arabic_numerals_do_not_trigger_a_false_mismatch(
         approved, _asr(recognized), audio_sha256="a" * 64,
     )
 
+
     assert aligned.report.level == "pass"
     assert aligned.report.violations == ()
+
+
+@pytest.mark.parametrize("recognized_year, expected", [("1601", "pass"), ("1602", "fail")])
+def test_digit_spelled_year_matches_only_the_same_arabic_year(recognized_year, expected):
+    prefix = "朝臣仍在等待皇帝作出决定。" * 8
+    approved = prefix + "直到一六〇一年。"
+    aligned = align_approved_text(approved, _asr(prefix + "直到" + recognized_year + "年。"), audio_sha256="a" * 64)
+    assert aligned.report.level == expected
+    assert aligned.approved_text == approved
+    assert bool(aligned.report.violations) == (expected == "fail")
 
 
 def test_moved_protected_term_fails_even_when_occurrence_count_is_equal() -> None:

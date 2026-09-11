@@ -6,10 +6,8 @@ __pycache__/
 htmlcov/
 .superpowers/
 .tmp_codex_session.json
-/punk-assets/
 .env
 config.yaml
-/workspace/book-menu.json
 workspace/books/
 workspace/voices/
 workspace/logs/
@@ -18,3 +16,7 @@ workspace/temp/
 *.wav
 *.mp4
 *.epub
+
+# Private production state, reviews and generated covers
+/workspace/
+/punk-assets/

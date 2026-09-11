@@ -193,7 +193,7 @@ def _review_from_manifest(
         if (
             expected_scene_ids is None
             or all_scene_ids is None
-            or len(all_scene_ids) not in {3, 4}
+            or not 3 <= len(all_scene_ids) <= 48
             or len(set(all_scene_ids)) != len(all_scene_ids)
             or len(expected_scene_ids) != 3
         ):

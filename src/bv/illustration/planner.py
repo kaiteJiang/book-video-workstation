@@ -172,6 +172,7 @@ def partition_illustration_timeline(
     seconds_per_scene_min: float | None = None,
     seconds_per_scene_max: float | None = None,
     target_scene_count: int | None = None,
+    semantic_boundary_ms: Sequence[int] | None = None,
 ) -> tuple[SceneWindow, ...]:
     if (
         not isinstance(master_duration_ms, int)
@@ -199,7 +200,7 @@ def partition_illustration_timeline(
         if (
             not isinstance(target_scene_count, int)
             or isinstance(target_scene_count, bool)
-            or not 3 <= target_scene_count <= 24
+            or not 3 <= target_scene_count <= 48
         ):
             raise IllustrationPlanError("invalid_target_scene_count")
         target_count = target_scene_count
@@ -220,6 +221,24 @@ def partition_illustration_timeline(
     if len(ordered) < target_count:
         raise IllustrationPlanError("insufficient_cue_boundaries")
 
+    semantic_starts: list[int] = []
+    if semantic_boundary_ms is not None:
+        boundaries = tuple(semantic_boundary_ms)
+        if (
+            len(boundaries) != target_count - 1
+            or any(not isinstance(value, int) or isinstance(value, bool) for value in boundaries)
+            or tuple(sorted(set(boundaries))) != boundaries
+            or any(value <= 0 or value >= master_duration_ms for value in boundaries)
+        ):
+            raise IllustrationPlanError("invalid_semantic_boundaries")
+        cue_starts = {cue.start_ms: index for index, cue in enumerate(ordered)}
+        try:
+            semantic_starts = [cue_starts[value] for value in boundaries]
+        except KeyError:
+            raise IllustrationPlanError("semantic_boundary_not_asr_aligned") from None
+        if semantic_starts != sorted(set(semantic_starts)):
+            raise IllustrationPlanError("invalid_semantic_boundaries")
+
     starts = [0]
     previous = 0
     for scene_number in range(1, target_count):
@@ -228,13 +247,11 @@ def partition_illustration_timeline(
         upper = len(ordered) - remaining_scenes
         target_ms = round(master_duration_ms * scene_number / target_count)
         candidates = range(lower, upper + 1)
-        boundary = min(
-            candidates,
-            key=lambda index: (
-                _boundary_cost(ordered, index, target_ms),
-                index,
-            ),
+        boundary = semantic_starts[scene_number - 1] if semantic_starts else min(
+            candidates, key=lambda index: (_boundary_cost(ordered, index, target_ms), index)
         )
+        if boundary not in candidates:
+            raise IllustrationPlanError("invalid_semantic_boundaries")
         starts.append(boundary)
         previous = boundary
     starts.append(len(ordered))
@@ -356,6 +373,11 @@ def plan_illustrations(
     seconds_per_scene_min: float | None = None,
     seconds_per_scene_max: float | None = None,
     target_scene_count: int | None = None,
+    semantic_boundary_ms: Sequence[int] | None = None,
+    important_events: Sequence[str] | None = None,
+    representative_scene_ids: Sequence[str] | None = None,
+    story_characters: Sequence[Mapping[str, object]] | None = None,
+    story_point_of_view: str | None = None,
     book_title: str | None = None,
     sequence_mode: VisualSequenceMode = "legacy-monochrome-reveal",
 ) -> tuple[CharacterBible, IllustrationStoryboard]:
@@ -374,6 +396,7 @@ def plan_illustrations(
         seconds_per_scene_min=seconds_per_scene_min,
         seconds_per_scene_max=seconds_per_scene_max,
         target_scene_count=target_scene_count,
+        semantic_boundary_ms=semantic_boundary_ms,
     )
     narration = _narration_windows(approved_text, tuple(cues), windows)
     root = _prepare_request_root(Path(request_root))
@@ -388,14 +411,22 @@ def plan_illustrations(
     ):
         raise IllustrationPlanError("unsafe_request_directory")
 
-    allowed_character_ids = _allowed_character_ids(approved_text)
+    allowed_character_ids = (
+        tuple(str(item["character_id"]) for item in story_characters)
+        if story_characters is not None else _allowed_character_ids(approved_text)
+    )
+    if story_characters is not None and (not allowed_character_ids or len(set(allowed_character_ids)) != len(allowed_character_ids)):
+        raise IllustrationPlanError("invalid_story_characters")
     payload: dict[str, object] = {
         "book_title": (book_title or book_id).strip(),
         "approved_text": approved_text,
         "semantic_lock": semantic_lock.model_dump(mode="json"),
         "style_decision": style_decision.model_dump(mode="json"),
         "allowed_character_ids": allowed_character_ids,
-        "visual_allocation": _visual_allocation(allowed_character_ids),
+        "visual_allocation": (
+            {"story_scenes": "Follow approved events and characters; no reader percentage quota."}
+            if story_characters is not None else _visual_allocation(allowed_character_ids)
+        ),
         "fixed_windows": [
             {
                 **window.model_dump(mode="json"),
@@ -404,7 +435,13 @@ def plan_illustrations(
             }
             for window, (text, span) in zip(windows, narration, strict=True)
         ],
+        "important_events": tuple(important_events or ()),
+        "continuity_instruction": "Preserve character identity, visual style and causal continuity. For narrative-unit A/B, change age, clothing, setting and camera when supported by the intervening story; never force the result to copy the initial shot.",
     }
+    if story_characters is not None:
+        payload["story_characters"] = tuple(story_characters)
+        payload["story_point_of_view"] = story_point_of_view
+        payload["story_character_instruction"] = "Use the explicit approved cast and IDs. Preserve third-person narration when specified; do not invent a first-person narrator or modern reader."
     if sequence_mode == "color-story-pair":
         payload["sequence_mode"] = sequence_mode
     prompt = compose_source_prompt(
@@ -431,6 +468,8 @@ def plan_illustrations(
         windows=windows,
         narration=narration,
         sequence_mode=sequence_mode,
+        representative_scene_ids=representative_scene_ids,
+        story_character_ids=allowed_character_ids if story_characters is not None else None,
     )
 
 
@@ -447,6 +486,8 @@ def _validate_visual_plan(
     windows: tuple[SceneWindow, ...],
     narration: tuple[tuple[str, tuple[int, int]], ...],
     sequence_mode: VisualSequenceMode,
+    representative_scene_ids: Sequence[str] | None = None,
+    story_character_ids: tuple[str, ...] | None = None,
 ) -> tuple[CharacterBible, IllustrationStoryboard]:
     if len(draft.scenes) != len(windows) or any(
         scene.scene_id != window.scene_id
@@ -456,7 +497,7 @@ def _validate_visual_plan(
     if _unsafe_model_output(draft):
         raise IllustrationPlanError("unsafe_visual_plan")
     if sequence_mode == "color-story-pair" and (
-        len(windows) not in {3, 4}
+        not 3 <= len(windows) <= 48
         or any(
             scene.semantic_turn_offset is None
             or scene.continuation_action is None
@@ -469,7 +510,7 @@ def _validate_visual_plan(
     character_values = tuple(
         character.model_dump(mode="python") for character in draft.characters
     )
-    if not 1 <= len(character_values) <= 3 or any(
+    if not 1 <= len(character_values) <= (24 if story_character_ids is not None else 3) or any(
         not value.strip()
         for character in character_values
         for value in character.values()
@@ -496,7 +537,10 @@ def _validate_visual_plan(
     allowed_character_refs = {
         character.character_id for character in character_bible.characters
     }
-    if draft.legacy_single_character:
+    if story_character_ids is not None:
+        if draft.legacy_single_character or not allowed_character_refs.issubset(set(story_character_ids)):
+            raise IllustrationPlanError("unapproved_story_character")
+    elif draft.legacy_single_character:
         if "史铁生" in approved_text:
             allowed_character_refs.add("source-author")
         if "母亲" in approved_text:
@@ -532,7 +576,9 @@ def _validate_visual_plan(
         if isinstance(draft.narrative_deviation_reason, str)
         else None
     )
-    if "source-protagonist" in allowed_character_refs:
+    if story_character_ids is not None:
+        pass
+    elif "source-protagonist" in allowed_character_refs:
         protagonist_count = sum(
             "source-protagonist" in scene.character_refs for scene in draft.scenes
         )
@@ -547,9 +593,21 @@ def _validate_visual_plan(
         if not 0.5 <= reader_ratio <= 0.7 and not deviation:
             raise IllustrationPlanError("narrative_ratio_unexplained")
 
-    representative_indexes = _representative_indexes(
-        draft.scenes, sequence_mode=sequence_mode
-    )
+    if representative_scene_ids is None:
+        representative_indexes = _representative_indexes(draft.scenes, sequence_mode=sequence_mode)
+    else:
+        selected = tuple(representative_scene_ids)
+        scene_ids = tuple(scene.scene_id for scene in draft.scenes)
+        if (
+            len(selected) != 3
+            or len(set(selected)) != 3
+            or selected[0] != scene_ids[0]
+            or selected[-1] != scene_ids[-1]
+            or any(scene_id not in scene_ids for scene_id in selected)
+            or not 0 < scene_ids.index(selected[1]) < len(scene_ids) - 1
+        ):
+            raise IllustrationPlanError("invalid_representative_scene_ids")
+        representative_indexes = {scene_ids.index(scene_id) for scene_id in selected}
     scenes: list[IllustrationScene] = []
     for index, (scene, window, (scene_narration, span)) in enumerate(
         zip(draft.scenes, windows, narration, strict=True)

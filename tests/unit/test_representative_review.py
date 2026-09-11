@@ -399,6 +399,25 @@ def test_three_story_pairs_have_no_batch_jobs_after_representative_approval(
     assert unlock_batch_jobs(storyboard, manifest, approval) == ()
 
 
+@pytest.mark.parametrize("scene_count", [16, 24, 30])
+def test_dynamic_story_pairs_unlock_complete_nonrepresentative_range(
+    tmp_path: Path, scene_count: int
+) -> None:
+    storyboard, manifest = _story_pair_manifest(tmp_path, scene_count=scene_count)
+    review = build_representative_review(storyboard, manifest)
+    approval = approve_representatives(
+        review, approved_image_sha256s=review.image_sha256s, reviewer="user"
+    )
+
+    unlocked = unlock_batch_jobs(storyboard, manifest, approval)
+
+    assert review.scene_ids == ("S01", f"S{scene_count // 2 + 1:02d}", f"S{scene_count:02d}")
+    assert len(unlocked) == (scene_count - 3) * 2
+    assert {job.scene_id for job in unlocked} == {
+        f"S{index:02d}" for index in range(1, scene_count + 1)
+    } - set(review.scene_ids)
+
+
 def test_user_cannot_approve_different_image_hashes(tmp_path: Path) -> None:
     storyboard, manifest = _manifest(tmp_path)
     review = build_representative_review(storyboard, manifest)

@@ -263,9 +263,19 @@ def test_real_handdrawn_renderer_keeps_title_author_above_unobscured_illustratio
         check=True,
     )
     pixmap = pymupdf.Pixmap(str(frame))
-    title_pixels = sum(
+    unsafe_top_pixels = sum(
         1
-        for y in range(140, 340, 2)
+        for y in range(100, 150, 2)
+        for x in range(60, 900, 2)
+        if (
+            pixmap.pixel(x, y)[0] < 100
+            and pixmap.pixel(x, y)[1] < 120
+            and pixmap.pixel(x, y)[2] < 150
+        )
+    )
+    safe_title_pixels = sum(
+        1
+        for y in range(160, 340, 2)
         for x in range(60, 900, 2)
         if (
             pixmap.pixel(x, y)[0] < 100
@@ -274,7 +284,8 @@ def test_real_handdrawn_renderer_keeps_title_author_above_unobscured_illustratio
         )
     )
 
-    assert title_pixels > 20
+    assert unsafe_top_pixels == 0
+    assert safe_title_pixels > 20
     illustration_pixel = pixmap.pixel(540, 960)[:3]
     assert illustration_pixel[0] > 150 and illustration_pixel[1] < 90
 

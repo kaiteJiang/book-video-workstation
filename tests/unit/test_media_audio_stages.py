@@ -162,6 +162,16 @@ def test_living_duration_boundaries(seconds: float, level: str) -> None:
     assert classify_narration_duration(seconds, policy=policy).level == level
 
 
+def test_story_duration_over_soft_max_is_review_warning_not_failure() -> None:
+    policy = duration_policy_from(ProductionProfile.longform_story_default().duration)
+
+    result = classify_narration_duration(720.0, policy=policy)
+
+    assert result.level == "pass"
+    assert result.band == "edge_long"
+    assert result.warnings == ["duration_above_soft_max"]
+
+
 def test_sample_projection_is_an_exact_contiguous_approved_span(tmp_path: Path) -> None:
     context = _context(tmp_path)
     start = TEXT.index("第二段")

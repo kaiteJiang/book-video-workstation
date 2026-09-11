@@ -82,6 +82,26 @@ def _cues(text: str, duration_ms: int, count: int = 9) -> tuple[SubtitleCue, ...
     )
 
 
+@pytest.mark.parametrize("scene_count", [16, 24, 30])
+def test_dynamic_partition_uses_exact_asr_semantic_boundaries(scene_count: int) -> None:
+    text = "甲" * (scene_count * 2)
+    duration_ms = scene_count * 10_000
+    cues = _cues(text, duration_ms, count=scene_count * 2)
+    boundaries = tuple(cues[index * 2].start_ms for index in range(1, scene_count))
+
+    windows = partition_illustration_timeline(
+        cues,
+        master_duration_ms=duration_ms,
+        target_scene_count=scene_count,
+        semantic_boundary_ms=boundaries,
+    )
+
+    assert len(windows) == scene_count
+    assert tuple(window.start_ms for window in windows[1:]) == boundaries
+    assert windows[0].from_frame == 0
+    assert windows[-1].to_frame == round(duration_ms * 30 / 1000)
+
+
 def _semantic_lock() -> SemanticLock:
     fields = {
         "episode_id": "E001",

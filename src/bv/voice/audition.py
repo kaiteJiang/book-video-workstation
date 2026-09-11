@@ -131,13 +131,19 @@ class VoiceAuditionService:
         voice_ids: tuple[str, ...],
         supported_voice_ids: tuple[str, ...],
         authorization: RuntimeAuthorization,
+        excerpt_span: tuple[int, int] | None = None,
     ) -> VoiceAuditionManifest:
         profile = load_production_profile(context.episode_root)
         _, script_text, script_sha256 = _approved_script(context)
         _validate_voice_ids(voice_ids, supported_voice_ids)
         if profile.tts.provider != "doubao" or profile.tts.voice_type is not None:
             raise VoiceAuditionError("voice_audition_not_required")
-        excerpt, span = _select_excerpt(script_text, speed=profile.tts.speed)
+        excerpt, span = select_audition_excerpt(
+            script_text,
+            speed=profile.tts.speed,
+            excerpt_span=excerpt_span,
+            prefer_narrative_peak=profile.narrative_mode == "story",
+        )
         excerpt_sha256 = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
         day = self.now().astimezone(
             timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -415,6 +421,26 @@ def _validate_voice_ids(
             raise VoiceAuditionError("voice_candidate_not_supported")
 
 
+def select_audition_excerpt(
+    text: str,
+    *,
+    speed: float,
+    excerpt_span: tuple[int, int] | None = None,
+    prefer_narrative_peak: bool = True,
+) -> tuple[str, tuple[int, int]]:
+    if excerpt_span is not None:
+        start, end = excerpt_span
+        if start < 0 or end <= start or end > len(text):
+            raise VoiceAuditionError("voice_audition_excerpt_span_invalid")
+        excerpt = text[start:end]
+        _validate_excerpt_duration(excerpt, speed=speed)
+        return excerpt, (start, end)
+
+    start = _narrative_peak_start(text) if prefer_narrative_peak else 0
+    excerpt, relative_span = _select_excerpt(text[start:], speed=speed)
+    return excerpt, (start + relative_span[0], start + relative_span[1])
+
+
 def _select_excerpt(text: str, *, speed: float) -> tuple[str, tuple[int, int]]:
     target_units = round(64 * speed)
     minimum_units = round(48 * speed)
@@ -433,6 +459,36 @@ def _select_excerpt(text: str, *, speed: float) -> tuple[str, tuple[int, int]]:
         raise VoiceAuditionError("voice_audition_excerpt_invalid")
     start = text.index(excerpt)
     return excerpt, (start, start + len(excerpt))
+
+
+def _validate_excerpt_duration(excerpt: str, *, speed: float) -> None:
+    units = sum(
+        1 for character in excerpt
+        if character.strip()
+        and character not in "，。！？；：、,.!?;:\n\r\t“”‘’（）()《》"
+    )
+    estimated = units / (3.2 * speed)
+    if not 15.0 <= estimated <= 25.0:
+        raise VoiceAuditionError("voice_audition_excerpt_invalid")
+
+
+def _narrative_peak_start(text: str) -> int:
+    paragraphs = tuple(
+        (match.start(), match.group())
+        for match in re.finditer(r"[^\r\n]+", text)
+        if match.group().strip()
+    )
+    if len(paragraphs) < 2:
+        return 0
+    threshold = max(1, len(text) // 6)
+    peaks = "却 直到 原来 突然 终于 发现 决定 离开 回来 死 真相 但是".split()
+    candidates = [item for item in paragraphs if item[0] >= threshold]
+    if not candidates:
+        return 0
+    return max(
+        candidates,
+        key=lambda item: (sum(item[1].count(word) for word in peaks), len(item[1]), -item[0]),
+    )[0]
 
 
 def _latest_manifest_path(episode_root: Path) -> Path:

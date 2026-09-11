@@ -139,7 +139,7 @@ def _validate_contract(
         raise QCError("duration_mismatch")
     if production_profile is not None:
         duration = facts.duration_ms / 1000
-        if not (
+        if not production_profile.duration.advisory_only and not (
             production_profile.duration.hard_min_seconds
             <= duration
             <= production_profile.duration.hard_max_seconds

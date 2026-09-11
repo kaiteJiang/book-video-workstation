@@ -212,6 +212,7 @@ class VoiceAuditionGateway(Protocol):
         voice_ids: tuple[str, ...],
         supported_voice_ids: tuple[str, ...],
         authorization: RuntimeAuthorization,
+        excerpt_span: tuple[int, int] | None = None,
     ) -> VoiceAuditionManifest: ...
 
     def approve_candidate(
@@ -444,16 +445,19 @@ class MediaProductionService:
         voice_ids: tuple[str, ...],
         supported_voice_ids: tuple[str, ...],
         authorization: RuntimeAuthorization,
+        excerpt_span: tuple[int, int] | None = None,
     ) -> MediaProductionView:
         episode = self._load(book_id, episode_id)
         if episode.status != "script_approved" or self.voice_auditions is None:
             raise MediaWorkflowError("voice_audition_not_ready")
         try:
+            excerpt_options = {} if excerpt_span is None else {"excerpt_span": excerpt_span}
             self.voice_auditions.prepare_candidates(
                 self._context(episode),
                 voice_ids=voice_ids,
                 supported_voice_ids=supported_voice_ids,
                 authorization=authorization,
+                **excerpt_options,
             )
         except VoiceAuditionError as error:
             raise MediaWorkflowError(error.error_code) from None
@@ -1335,15 +1339,8 @@ class MediaProductionService:
             )
             if storyboard.sequence_mode == "color-story-pair":
                 all_scene_ids = tuple(scene.scene_id for scene in storyboard.scenes)
-                if len(all_scene_ids) == 3:
-                    expected_storyboard_ids = all_scene_ids
-                elif len(all_scene_ids) == 4:
-                    expected_storyboard_ids = (
-                        all_scene_ids[0],
-                        all_scene_ids[2],
-                        all_scene_ids[3],
-                    )
-                else:
+                expected_storyboard_ids = storyboard_ids
+                if not 3 <= len(all_scene_ids) <= 48 or len(expected_storyboard_ids) != 3:
                     raise ValueError
                 expected = tuple(
                     asset_id

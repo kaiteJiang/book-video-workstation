@@ -153,16 +153,14 @@ class CharacterLock(_IllustrationModel):
 class CharacterBible(_IllustrationModel):
     source_script_sha256: Sha256
     style_fingerprint: Sha256
-    characters: tuple[CharacterLock, ...] = Field(min_length=1, max_length=3)
+    characters: tuple[CharacterLock, ...] = Field(min_length=1, max_length=24)
 
     @model_validator(mode="after")
     def _validate_characters(self) -> CharacterBible:
         identifiers = tuple(item.character_id for item in self.characters)
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("duplicate_character_id")
-        if not set(identifiers).issubset(
-            {"reader-01", "source-protagonist", "source-family-01"}
-        ):
+        if any(identifier != "reader-01" and not identifier.startswith("source-") for identifier in identifiers):
             raise ValueError("unsupported_character_id")
         if any(
             item.source_script_sha256 != self.source_script_sha256
@@ -311,7 +309,7 @@ class IllustrationStoryboard(_IllustrationModel):
             if current.from_frame < previous.to_frame:
                 raise ValueError("scene_frame_overlap")
         if self.sequence_mode == "color-story-pair":
-            if len(self.scenes) not in {3, 4}:
+            if not 3 <= len(self.scenes) <= 48:
                 raise ValueError("story_pair_scene_count_invalid")
             for scene in self.scenes:
                 required = (

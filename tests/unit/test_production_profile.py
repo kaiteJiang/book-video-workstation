@@ -114,6 +114,23 @@ def test_living_default_uses_color_story_pairs() -> None:
     assert visual.scene_count == 4
 
 
+def test_longform_story_profile_is_advisory_and_dynamic() -> None:
+    profile = ProductionProfile.longform_story_default()
+
+    assert profile.narrative_mode == "story"
+    assert profile.duration.ideal_min_seconds == 360
+    assert profile.duration.ideal_max_seconds == 480
+    assert profile.duration.soft_max_seconds == 600
+    assert profile.visual.scene_count is None
+    assert profile.duration.advisory_only is True
+    assert profile.duration_advisories(420) == ()
+    assert profile.duration_advisories(300) == ("outside_recommended_story_duration",)
+    assert profile.duration_advisories(601) == (
+        "outside_recommended_story_duration",
+        "story_duration_above_soft_max",
+    )
+
+
 def test_doubao_profile_can_persist_approved_voice_id(tmp_path: Path) -> None:
     _write_profile(tmp_path, tts__voice_type="zh_female_reader")
 

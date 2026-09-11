@@ -519,6 +519,15 @@ def _media_runtime_stage_config_resolver(
             return base
         profile = load_production_profile(episode_root).model_dump(mode="json")
         payload = {field: profile[field] for field in fields}
+        if profile.get('narrative_mode') == 'story' and name in {
+            'plan_illustrations', 'prepare_representatives', 'visual_render', 'render', 'qc',
+        }:
+            plan_path = episode_root / 'script' / 'ab_units.json'
+            payload['ab_semantics'] = 'narrative-unit-v1'
+            payload['ab_units_sha256'] = (
+                hashlib.sha256(plan_path.read_bytes()).hexdigest()
+                if plan_path.is_file() else 'missing'
+            )
         encoded = json.dumps(
             {"base": base, "profile": payload},
             ensure_ascii=False,

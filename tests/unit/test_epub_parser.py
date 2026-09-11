@@ -188,9 +188,10 @@ def test_epub_resolves_manifest_href_against_exact_opf_directory(
         environment["PYTHONHASHSEED"] = str(seed)
         titles.append(
             subprocess.check_output(
-                [sys.executable, "-c", probe],
+                [sys.executable, "-X", "utf8", "-c", probe],
                 env=environment,
                 text=True,
+                encoding="utf-8",
             ).strip()
         )
 

@@ -7,7 +7,7 @@ import stat
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, field_validator, model_serializer, model_validator
 
 
 VisualSequenceMode = Literal[
@@ -31,6 +31,17 @@ class DurationProfile(_ProfileModel):
     ideal_min_seconds: float = Field(gt=0)
     ideal_max_seconds: float = Field(gt=0)
     hard_max_seconds: float = Field(gt=0)
+    soft_max_seconds: float | None = Field(default=None, gt=0)
+    advisory_only: bool = False
+
+    @model_serializer(mode="wrap")
+    def _serialize_legacy_compatibly(self, handler: SerializerFunctionWrapHandler) -> object:
+        payload = handler(self)
+        if isinstance(payload, dict) and self.soft_max_seconds is None:
+            payload.pop("soft_max_seconds", None)
+        if isinstance(payload, dict) and not self.advisory_only:
+            payload.pop("advisory_only", None)
+        return payload
 
     @model_validator(mode="after")
     def _validate_order(self) -> DurationProfile:
@@ -40,6 +51,8 @@ class DurationProfile(_ProfileModel):
             <= self.ideal_max_seconds
             <= self.hard_max_seconds
         ):
+            raise ValueError("invalid_duration_profile")
+        if self.soft_max_seconds is not None and self.soft_max_seconds < self.ideal_max_seconds:
             raise ValueError("invalid_duration_profile")
         return self
 
@@ -82,7 +95,7 @@ class VisualProfile(_ProfileModel):
     representative_count: Literal[3]
     transition: Literal["cross-dissolve"]
     sequence_mode: VisualSequenceMode = "legacy-monochrome-reveal"
-    scene_count: int | None = Field(default=None, ge=3, le=24)
+    scene_count: int | None = Field(default=None, ge=3, le=48)
     style_id: str | None = None
 
     @field_validator("style_id")
@@ -134,10 +147,18 @@ class DeliveryProfile(_ProfileModel):
 
 class ProductionProfile(_ProfileModel):
     schema_version: Literal[1]
+    narrative_mode: Literal["value", "story"] = "value"
     duration: DurationProfile
     tts: TtsProfile
     visual: VisualProfile
     delivery: DeliveryProfile
+
+    @model_serializer(mode="wrap")
+    def _serialize_legacy_compatibly(self, handler: SerializerFunctionWrapHandler) -> object:
+        payload = handler(self)
+        if isinstance(payload, dict) and self.narrative_mode == "value":
+            payload.pop("narrative_mode", None)
+        return payload
 
     @classmethod
     def short_book_default(cls) -> ProductionProfile:
@@ -199,6 +220,43 @@ class ProductionProfile(_ProfileModel):
                 include=_DELIVERY_ARTIFACTS,
             ),
         )
+
+    @classmethod
+    def longform_story_default(cls) -> ProductionProfile:
+        """Long-form story guidance: 6-8 minutes, with a review-only 10 minute cap."""
+        return cls(
+            schema_version=1,
+            narrative_mode="story",
+            duration=DurationProfile(
+                hard_min_seconds=1.0,
+                ideal_min_seconds=360.0,
+                ideal_max_seconds=480.0,
+                hard_max_seconds=600.0,
+                soft_max_seconds=600.0,
+                advisory_only=True,
+            ),
+            tts=TtsProfile(provider="doubao", resource_id="seed-tts-2.0", voice_type=None, speed=1.12),
+            visual=VisualProfile(
+                seconds_per_scene_min=12.0,
+                seconds_per_scene_max=30.0,
+                representative_count=3,
+                transition="cross-dissolve",
+                sequence_mode="color-story-pair",
+                scene_count=None,
+            ),
+            delivery=DeliveryProfile(timezone="Asia/Shanghai", include=_DELIVERY_ARTIFACTS),
+        )
+
+    def duration_advisories(self, actual_seconds: float) -> tuple[str, ...]:
+        """Return review hints without rejecting a valid story duration."""
+        if self.narrative_mode != "story":
+            return ()
+        advisories: list[str] = []
+        if not self.duration.ideal_min_seconds <= actual_seconds <= self.duration.ideal_max_seconds:
+            advisories.append("outside_recommended_story_duration")
+        if self.duration.soft_max_seconds is not None and actual_seconds > self.duration.soft_max_seconds:
+            advisories.append("story_duration_above_soft_max")
+        return tuple(advisories)
 
 
 LEGACY_PRODUCTION_PROFILE = ProductionProfile(

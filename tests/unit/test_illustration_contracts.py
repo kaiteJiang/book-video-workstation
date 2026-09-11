@@ -187,12 +187,17 @@ def test_story_pair_storyboard_rejects_blank_continuation_fields(
         _pair_storyboard(scenes=tuple(scenes))
 
 
-@pytest.mark.parametrize("scene_count", [2, 5])
+@pytest.mark.parametrize("scene_count", [2, 49])
 def test_story_pair_storyboard_rejects_unsupported_scene_counts(
     scene_count: int,
 ) -> None:
     with pytest.raises(ValidationError, match="story_pair_scene_count_invalid"):
         _pair_storyboard(scene_count=scene_count)
+
+
+@pytest.mark.parametrize("scene_count", [16, 24, 30])
+def test_story_pair_storyboard_accepts_bounded_dynamic_scene_counts(scene_count: int) -> None:
+    assert len(_pair_storyboard(scene_count=scene_count).scenes) == scene_count
 
 
 @pytest.mark.parametrize(

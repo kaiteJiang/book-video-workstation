@@ -6,7 +6,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -16,6 +16,7 @@ from bv.asr.alignment import AlignedScript, align_approved_text
 from bv.asr.volcengine import AsrResult, FlashRequest, VolcCredentials, recognize_flash
 from bv.config import IndexTTS2Config
 from bv.content.scripts import ScriptPackage, SemanticLock
+from bv.content.story_visual import load_approved_story_visual_context
 from bv.core.atomic import atomic_write_json
 from bv.core.hashing import sha256_file
 from bv.illustration.assets import prepare_image_jobs
@@ -34,6 +35,7 @@ from bv.illustration.contracts import (
     load_character_bible,
 )
 from bv.illustration.planner import plan_illustrations
+from bv.illustration.story_units import load_story_units
 from bv.illustration.prompts import canonical_model_sha256
 from bv.illustration.renderer import render_silent_story
 from bv.illustration.style_selector import (
@@ -388,11 +390,14 @@ class AsrStage:
             audio_path=master,
             audio_sha256=manifest.master_sha256,
             endpoint=self.endpoint,
+            longform=load_production_profile(context.episode_root).narrative_mode == "story",
         )
         try:
             result = invoke_external(
                 self.authorization,
-                lambda: self.recognizer(self.credentials, request),
+                lambda: self.recognizer(self.credentials, request, **(
+                    {"timeout": 300.0} if request.longform and self.recognizer is recognize_flash else {}
+                )),
             )
             aligned = self.aligner(
                 narration.text,
@@ -553,6 +558,58 @@ class StyleSelectionStage:
         )
 
 
+def _approved_story_context(context: StageContext):
+    # Validation always binds the complete approved manuscript, even for a sample projection.
+    whole = approved_narration_input(context, mode="full")
+    return load_approved_story_visual_context(
+        context.episode_root, book_id=context.book_id, episode_id=context.episode_id,
+        approved_text=whole.text, approved_sha256=whole.sha256,
+    )
+
+
+def _story_scene_boundaries(sections, aligned: AlignedScript, cues: tuple[SubtitleCue, ...], master_duration_ms: int, *, strict: bool = False) -> tuple[int, ...]:
+    """Map approved story beats to ASR cue starts, merging unusably short windows."""
+    starts = sorted({cue.start_ms for cue in cues if 0 < cue.start_ms < master_duration_ms})
+    minimum_ms = 4_000  # A >= 1s plus B reveal/hold/transition >= 3s.
+    boundaries: list[int] = []
+    for section in sections[1:]:
+        timed = next((item for item in aligned.characters[section.start:] if item.start_ms is not None), None)
+        if timed is None or not starts:
+            continue
+        boundary = min(starts, key=lambda value: (abs(value - timed.start_ms), value))
+        if boundary - (boundaries[-1] if boundaries else 0) >= minimum_ms and master_duration_ms - boundary >= minimum_ms:
+            boundaries.append(boundary)
+    if strict:
+        if len(sections) < 3 or len(boundaries) != len(sections) - 1:
+            raise ValueError("ab_units_need_replanning_not_mechanical_split")
+        return tuple(boundaries)
+    # A coarse three-act manuscript can still need a minimum of three reviewed pairs.
+    # Split the largest surviving window at a real sentence-ending cue where possible.
+    cue_by_start = {cue.start_ms: index for index, cue in enumerate(cues)}
+    while len(boundaries) < 2:
+        edges = [0, *boundaries, master_duration_ms]
+        spans = sorted(zip(edges, edges[1:]), key=lambda pair: pair[1] - pair[0], reverse=True)
+        chosen = None
+        for left, right in spans:
+            options = [value for value in starts if value - left >= minimum_ms and right - value >= minimum_ms]
+            if options:
+                def score(value):
+                    index = cue_by_start[value]
+                    sentence_end = index > 0 and cues[index - 1].text.rstrip().endswith(("。", "！", "？", ".", "!", "?"))
+                    return (not sentence_end, abs(value - (left + right) / 2), value)
+                chosen = min(options, key=score)
+                break
+        if chosen is None:
+            raise ValueError("story_semantic_windows_too_short")
+        boundaries.append(chosen)
+        boundaries.sort()
+    while len(boundaries) > 47:
+        edges = [0, *boundaries, master_duration_ms]
+        remove = min(range(len(boundaries)), key=lambda index: edges[index + 2] - edges[index])
+        boundaries.pop(remove)
+    return tuple(boundaries)
+
+
 class IllustrationPlanningStage:
     def __init__(
         self,
@@ -593,6 +650,29 @@ class IllustrationPlanningStage:
             book_title = book_payload.get("title")
             if not isinstance(book_title, str) or not book_title.strip():
                 raise ValueError("book_title_invalid")
+            story = _approved_story_context(context)
+            story_options: dict[str, object] = {}
+            scene_count = production_profile.visual.scene_count
+            if story is not None:
+                source_start, source_end = narration.source_span
+                full_text = (context.episode_root / "script" / "approved.txt").read_text(encoding="utf-8")
+                units = load_story_units(context.episode_root / "script" / "ab_units.json", full_text)
+                selected = tuple(unit for unit in units if unit.start < source_end and unit.end > source_start)
+                if any(unit.start < source_start or unit.end > source_end for unit in selected):
+                    raise ValueError("ab_sample_must_cover_whole_units")
+                sections = tuple(replace(unit, start=unit.start-source_start, end=unit.end-source_start) for unit in selected)
+                boundaries = _story_scene_boundaries(sections, aligned, cues, voice.master_duration_ms, strict=True)
+                scene_count = len(boundaries) + 1
+                cast = tuple(item.model_dump(mode="json") for item in story.characters)
+                if not cast:
+                    cast = ({"character_id": "source-protagonist", "name": "故事中心人物", "description": "依据批准文稿中明确的人物身份绘制；不得将第三人称改为第一人称", "evidence_ids": []},)
+                story_options = {
+                    "semantic_boundary_ms": boundaries,
+                    "important_events": tuple(json.dumps(section.data, ensure_ascii=False) for section in sections),
+                    "representative_scene_ids": ("S01", f"S{scene_count // 2 + 1:02d}", f"S{scene_count:02d}"),
+                    "story_characters": cast,
+                    "story_point_of_view": story.point_of_view,
+                }
             character, storyboard = plan_illustrations(
                 book_id=context.book_id,
                 approved_text=narration.text,
@@ -610,10 +690,18 @@ class IllustrationPlanningStage:
                 seconds_per_scene_max=(
                     production_profile.visual.seconds_per_scene_max
                 ),
-                target_scene_count=production_profile.visual.scene_count,
+                target_scene_count=scene_count,
+                **story_options,
                 book_title=book_title,
                 sequence_mode=production_profile.visual.sequence_mode,
             )
+            if story is not None:
+                if len(storyboard.scenes) != len(selected):
+                    raise ValueError("ab_unit_count_changed")
+                for scene, unit in zip(storyboard.scenes, selected, strict=True):
+                    expected = unit.start - source_start + full_text[unit.start:unit.end].index(unit.data["b_entry_text"])
+                    if scene.semantic_turn_span is None or scene.semantic_turn_span[1] != expected:
+                        raise ValueError("ab_result_reveal_drift")
         except Exception as error:
             if error.__class__.__name__ == "ExternalAuthorizationError":
                 raise
@@ -626,6 +714,8 @@ class IllustrationPlanningStage:
         return StageOutcome(
             outputs={"character_bible": character_path, "illustration_storyboard": storyboard_path},
             inputs={
+                **({"source_contract_sha256": story.source_contract_sha256,
+                    "ab_units_sha256": sha256_file(context.episode_root / 'script' / 'ab_units.json')} if story is not None else {}),
                 "script_sha256": narration.sha256,
                 "audio_sha256": voice.master_sha256,
                 "prompt_sha256": prompt.sha256,
@@ -997,7 +1087,10 @@ def _visual_sources(context: StageContext) -> tuple[NarrationInput, SemanticLock
     try:
         voice = VoiceManifest.model_validate_json(voice_path.read_text(encoding="utf-8"))
         narration = _current_narration(context, voice.script_sha256)
-        if os.path.lexists(package_path):
+        story = _approved_story_context(context)
+        if story is not None:
+            lock = story.semantic_lock
+        elif os.path.lexists(package_path):
             if _is_reparse_or_symlink(package_path) or not package_path.is_file():
                 raise ValueError
             lock = ScriptPackage.model_validate_json(

@@ -43,6 +43,7 @@ from bv.content.synthesis import (
     validate_claim_references,
     validate_value_coverage,
 )
+from bv.content.story import approve_story_candidate
 from bv.content.topics import EpisodeBrief, TopicGenerationError, TopicService
 from bv.core.atomic import atomic_write_json
 from bv.core.hashing import sha256_file
@@ -1669,6 +1670,40 @@ class ScriptApprovalStage:
 
     def run(self, context: StageContext) -> StageOutcome:
         script_root = Path(context.episode_root) / "script"
+        story_manifest_path = script_root / "story_candidate.json"
+        episode = context.episode_state or self.store.load_episode(
+            context.book_id, context.episode_id
+        )
+        draft_manifest = episode.stage_manifests.get("draft_script")
+        if (
+            story_manifest_path.is_file()
+            and draft_manifest is not None
+            and "story_candidate" in draft_manifest.outputs
+        ):
+            try:
+                result = approve_story_candidate(
+                    self.store, context.book_id, context.episode_id
+                )
+            except Exception as exc:
+                _wrap_stable_error(exc, "script_approval_failed")
+            if context.episode_state is not None:
+                context.episode_state.script_hash = result.episode_state.script_hash
+                context.episode_state.completed_stages = list(
+                    result.episode_state.completed_stages
+                )
+                context.episode_state.stale_stages = list(
+                    result.episode_state.stale_stages
+                )
+                context.episode_state.stage_manifests = dict(
+                    result.episode_state.stage_manifests
+                )
+            return StageOutcome(
+                outputs={
+                    "approved_script": result.approved_path,
+                    "script_manifest": result.manifest_path,
+                },
+                inputs={"story_candidate_manifest": _sha256(story_manifest_path)},
+            )
         package_path = script_root / "script_package.json"
         review_path = script_root / "review.md"
         _require_nonempty_file(package_path, "script_package_invalid")

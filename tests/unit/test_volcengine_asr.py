@@ -37,6 +37,44 @@ def _request(path: Path) -> FlashRequest:
     )
 
 
+def test_longform_flash_accepts_eight_minute_master_without_changing_audio(tmp_path: Path) -> None:
+    master = tmp_path / "longform.wav"
+    _write_master(master, frames=48_000 * 480)
+    legacy = _request(master)
+    with pytest.raises(VolcengineAsrError, match="master_audio_too_large"):
+        build_flash_payload(legacy)
+    request = legacy.model_copy(update={"longform": True})
+    calls = []
+    def transport(**kwargs):
+        payload = json.loads(kwargs["body"])
+        assert hashlib.sha256(base64.b64decode(payload["audio"]["data"])).hexdigest() == request.audio_sha256
+        calls.append(kwargs["timeout"])
+        return 200, {"X-Api-Status-Code": "20000000"}, json.dumps({
+            "result": {"text": "结尾", "utterances": [{"words": [
+                {"text": "结尾", "start_time": 478_000, "end_time": 479_000}
+            ]}]}
+        }).encode()
+    result = recognize_flash(VolcCredentials(api_key="test-only"), request, transport=transport, timeout=300)
+    assert result.duration_ms == 480_000
+    assert result.audio_sha256 == request.audio_sha256
+    assert result.words[0].end_time == 479_000
+    assert calls == [300]
+
+
+def test_longform_flash_keeps_size_and_duration_bounds(tmp_path: Path, monkeypatch) -> None:
+    import bv.asr.volcengine as module
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    request = _request(master).model_copy(update={"longform": True})
+    monkeypatch.setattr(module, "_LONGFORM_MAX_DURATION_MS", 44_000)
+    with pytest.raises(VolcengineAsrError, match="invalid_master_audio"):
+        build_flash_payload(request)
+    monkeypatch.setattr(module, "_LONGFORM_MAX_DURATION_MS", 7_200_000)
+    monkeypatch.setattr(module, "_LONGFORM_MAX_AUDIO_BYTES", 100)
+    with pytest.raises(VolcengineAsrError, match="master_audio_too_large"):
+        build_flash_payload(request)
+
+
 @pytest.mark.parametrize(
     "credentials",
     [

@@ -398,6 +398,10 @@ def _canonical_number_token(token: str) -> str:
     }
     small_units = {"十": 10, "百": 100, "千": 1_000}
     large_units = {"万": 10_000, "亿": 100_000_000}
+    # Digit-by-digit years and identifiers are not place-value expressions.
+    # 一六〇一 is 1601, while 一千六百零一 follows the unit parser below.
+    if normalized and all(character in digits for character in normalized):
+        return "".join(str(digits[character]) for character in normalized)
     if not normalized or any(
         character not in digits and character not in small_units and character not in large_units
         for character in normalized

@@ -12,18 +12,18 @@ Keep the approved story-pair meaning and presentation mechanics stable while let
 1. Read [the visual contract](references/visual-contract.md) before planning illustrations, rendering a sample, restyling an episode, or approving final media.
 2. Treat the final narration as the global clock. Use its final ASR alignment to map each approved narration semantic turn to a scene frame; preserve the script, audio, subtitle timing, scene boundaries, story-pair meanings, title overlay, transitions, and encoding contract.
 3. **REQUIRED SUB-SKILL:** Use `jl-oral-linebreaks` in short-subtitle mode before subtitle generation. Save `script/subtitle_breaks.txt`, run its line checker with `--max-cjk 14`, and require the reconstructed text to match the approved narration.
-4. Plan 3--4 scenes as 6--8 full-color story-pair masters. For every scene, generate color A first from local frame 0, then generate color B with the exact current A path and SHA-256 as its first-priority image reference. B keeps A's identity, clothing, setting, camera direction, and style while advancing exactly one narration-supported action.
+4. For long-form, use [bv-story-unit-ab](../bv-story-unit-ab/SKILL.md) for narrative semantics. Each A/B pair spans a complete story unit from initial situation through narrated development to climax/result; never reduce it to a gesture change. Keep identity and style, allowing story-supported changes in time, location, age, clothing and camera. Generate A first and bind B to its current path/SHA-256 as identity reference, not a frozen shot. ASR controls when the result is revealed. Formal videos use 3--48 units; a user-requested standalone prototype may show one complete unit without manufacturing three pairs.
 5. For a style replacement, preserve the approved storyboard after excluding only style fingerprints, prompts, asset paths, and asset hashes. Regenerate both A and B in every pair while preserving its semantic turn and story-pair meaning; never rerun writing, TTS, ASR, subtitle timing, or semantic scene planning.
-6. For four scenes, show S01-A/B, S03-A/B, and S04-A/B together as six representative images; only their approval authorizes S02-A then S02-B. For three scenes, all three pairs are representatives. This approval does not authorize changes to narration, voice, subtitles, cover, QC, delivery, or final approval.
+6. Show exactly three complete A/B pairs together: the opening, one user-approved meaningful middle event, and the ending. For the legacy four-scene layout this remains S01, S03, and S04; for three scenes all pairs remain representatives. Follow the current user authorization; do not request the same approval again when final production is already explicitly authorized. A representative-only approval authorizes only the remaining pairs. This approval does not authorize changes to narration, voice, subtitles, cover, QC, delivery, or final approval.
 7. Render and inspect the required A, ink midpoint, B, transition, title, and subtitle frames. Keep the result as a candidate until the user approves it.
 
 ## Style boundary
 
-Replaceable: style ID, medium, brushwork, texture, palette, character rendering language, style prompt atoms, and the 6--8 full-color A/B assets derived from them.
+Replaceable: style ID, medium, brushwork, texture, palette, character rendering language, style prompt atoms, and all full-color A/B assets derived from them.
 
 Stable: story-pair meaning, semantic-turn span and ASR mapping, continuity constraints, layout, typography, subtitle treatment, 45-frame multi-point ink bloom, 15-frame cross-dissolve, and final media specifications.
 
-If a requested style conflicts with the stable presentation layer, report the conflict and ask whether the user wants a new presentation contract. Do not silently mutate both layers.
+A user-requested story-unit restructure is distinct from style-only replacement. Follow the user's authorized scope, preserve historical artifacts, and regenerate affected dependencies; do not claim the old approval applies to changed narration or story structure.
 
 ## Legacy compatibility
 

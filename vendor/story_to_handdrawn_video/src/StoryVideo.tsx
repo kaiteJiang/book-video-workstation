@@ -19,7 +19,7 @@ const TitleOverlay: React.FC<{
         zIndex: 100,
         pointerEvents: 'none',
         alignItems: 'center',
-        paddingTop: 104,
+        paddingTop: 160,
         color: '#123858',
         fontFamily:
           'Microsoft YaHei, PingFang SC, Noto Sans CJK SC, sans-serif',
