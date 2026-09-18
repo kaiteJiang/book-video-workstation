@@ -1,0 +1,22 @@
+{
+  "title": "八千字从0到1讲清不一样的读书视频，制作角度对当前版本直接降维打击",
+  "date": "2026-09-18",
+  "han_character_count": 7567,
+  "image_generation": "Built-in ImageGen; exact ratio normalized by adding 2 right-edge pixels and 1 bottom-edge pixel; original content not cropped",
+  "cover_style": "punk-cover/giant-perspective-chinese-title",
+  "triptych_note": "ImageGen composite based on three historical illustrations; not a pixel-identical montage or video screenshot",
+  "assets": [
+    {
+      "file": "assets/cover-5x2.png",
+      "width": 1985,
+      "height": 794,
+      "sha256": "e9315407d07f2748449c1f8fbbf38d0a559043968bf157b1808ceb6ca2230f62"
+    },
+    {
+      "file": "assets/history-triptych-5x2.png",
+      "width": 1985,
+      "height": 794,
+      "sha256": "019ce7d5fbb7a264988eb9796c43ebd27d87078b5c492192346d901d24e627ab"
+    }
+  ]
+}

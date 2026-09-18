@@ -22,6 +22,8 @@ BV Workstation 是一个面向 Windows 的图书故事视频工作台。它接�
 
 当前创作路线见 [长篇故事生产手册](docs/runbooks/longform-story-production.md)。Agent 总入口为 [图书视频生产 Skill](skills/producing-book-handdrawn-videos/SKILL.md)，故事小节和视觉规格由两个专项 Skill 维护。文稿按故事完整性决定长度，常用预算 6–8 分钟，10 分钟为软提醒；声音从候选池中按故事筛选，AB 套图按语义节点增加。文稿直接写作，不依赖去 AI 味 Skill。旧短视频模式保留兼容。
 
+新手可以先读 [从 0 到 1 的开源部署与创作分享](docs/share/open-source-deployment.zh-CN.md)，包含实际配图展示、Windows 部署、首条作品流程和内容经营思路；[HTML 阅读版](docs/share/index.html) 可下载后在浏览器打开。
+
 它没有假装一条命令就能替你做完所有判断。文稿、音色、代表图和成片都有明确停点，只有得到批准，流水线才会继续消耗下一阶段的资源。
 
 ## 它解决了什么
