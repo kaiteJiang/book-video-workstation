@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal
 import hashlib
 import re
 import unicodedata
@@ -363,7 +364,7 @@ def _nonoverlapping_occurrences(text: str, tokens: tuple[str, ...]) -> list[_Sen
 
 def _number_occurrences(text: str) -> list[_SensitiveOccurrence]:
     normalized, comparison_spans = _nfkc_with_comparison_spans(text)
-    pattern = re.compile(r"[0-9]+(?:[.,][0-9]+)*|[零〇一二两三四五六七八九十百千万亿]+")
+    pattern = re.compile(r"[0-9]+(?:[.,][0-9]+)*(?:[万亿])?|[零〇一二两三四五六七八九十百千万亿]+")
     occurrences: list[_SensitiveOccurrence] = []
     for match in pattern.finditer(normalized):
         spans = [
@@ -380,6 +381,10 @@ def _number_occurrences(text: str) -> list[_SensitiveOccurrence]:
 
 def _canonical_number_token(token: str) -> str:
     normalized = unicodedata.normalize("NFKC", token).replace(",", "")
+    mixed = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([万亿])", normalized)
+    if mixed:
+        value = Decimal(mixed.group(1)) * {"万": 10_000, "亿": 100_000_000}[mixed.group(2)]
+        return format(value.normalize(), "f")
     if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", normalized):
         return normalized
     digits = {

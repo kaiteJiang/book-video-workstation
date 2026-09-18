@@ -221,6 +221,24 @@ def test_digit_spelled_year_matches_only_the_same_arabic_year(recognized_year, e
     assert bool(aligned.report.violations) == (expected == "fail")
 
 
+@pytest.mark.parametrize("recognized, expected", [
+    ("1657年，18名大臣，14万人。", "pass"),
+    ("1657年，18名大臣，140000人。", "review"),
+    ("1657年，18名大臣，15万人。", "fail"),
+    ("1657年，18名大臣，14人。", "fail"),
+    ("1658年，18名大臣，14万人。", "fail"),
+])
+def test_mixed_arabic_chinese_unit_keeps_numeric_meaning(recognized, expected):
+    prefix = "将领率军出征，队伍按计划行进。" * 10
+    aligned = align_approved_text(
+        prefix + "一六五七年，十八名大臣，十四万人。",
+        _asr(prefix + recognized), audio_sha256="a" * 64,
+    )
+    assert aligned.report.level == expected
+    if expected != "fail":
+        assert not aligned.report.violations
+
+
 def test_moved_protected_term_fails_even_when_occurrence_count_is_equal() -> None:
     approved = "核心术语位于甲处，普通词语位于乙处。" + "丙" * 80
     recognized = "普通词语位于甲处，核心术语位于乙处。" + "丙" * 80

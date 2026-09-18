@@ -30,7 +30,7 @@ BV Workstation 是一个面向 Windows 的图书故事视频工作台。它接�
 <tr>
 <td width="33%" valign="top">
 
-### 🧠 整本书理解
+### 🧠 来源与核心故事
 
 标题作者模式会先建立书籍身份和证据边界。文稿围绕一个核心故事，以事件、冲突、应对和结果推进。
 
@@ -46,7 +46,7 @@ BV Workstation 是一个面向 Windows 的图书故事视频工作台。它接�
 
 ### 🧾 可核验交付
 
-最终包包含音频、字幕、画面、封面、渲染事实和 QC 清单。进程结束不等于成片合格。
+内部保留音频、字幕、画面及 QC 清单；对外交付文件夹只含成品视频与封面。进程结束不等于成片合格。
 
 </td>
 </tr>
@@ -144,6 +144,9 @@ flowchart LR
 git clone https://github.com/kaiteJiang/book-video-workstation.git
 Set-Location book-video-workstation
 uv sync --group dev
+Push-Location vendor/story_to_handdrawn_video
+npm ci
+Pop-Location
 ```
 
 ### 2. 建立本机配置
@@ -173,10 +176,9 @@ uv run bv new .\book.txt --title "书名" --author "作者"
 
 ```powershell
 uv run bv status --book-id <book_id>
-uv run bv next <book_id>
 ```
 
-只有用户明确授权当前阶段时，Agent 才能在对应命令上使用 `--allow-external`。
+`bv next` 会推进生产，不是状态查询。新故事先由 Agent 按生产手册准备完整正文与证据合同，再通过 `bv import-story` 登记候选；不要直接进入旧 value 起稿路径。只有用户明确授权当前阶段时，Agent 才能在对应命令上使用 `--allow-external`。
 
 ## 直接交给 Agent
 
@@ -188,12 +190,12 @@ docs/runbooks/longform-story-production.md，再运行只读的环境检查与�
 不要打印或提交任何密钥、Cookie、电子书正文、私人笔记和供应商原始响应。
 
 输入是书名加作者，或我有权使用的 TXT、PDF、EPUB 文件。
-用第一视角优先的直接写作方式，讲透一个最值得说的故事，不使用去 AI 味 Skill。
+依据实际资料选择最适合叙事的视角，写明叙述者的认知边界，讲透一个核心故事；不使用去 AI 味 Skill。
 严格按门禁推进：先给我确认完整长稿，再做同片段音色试听，再做三组完整 AB 代表图，
 批准后按语义补齐其余 AB，最后渲染竖屏视频和 3:4 独立封面。
 长度由故事决定，常用 6–8 分钟，优先控制在 10 分钟内，不凑时长。
-画风固定使用第 11 种 retro-gouache-concept。
-每次准备调用外部服务前，说明服务、输入、预计产物和是否可能收费，等我批准。
+按本篇作品约定选择画风；每对 AB 表现完整故事小节的起点与高潮或结果。
+外部调用按本次授权和生产门禁执行；已有明确授权的阶段不重复询问。
 没有真实媒体、清单、探测结果和 QC 报告时，不要声称已经完成。
 不要上传任何平台。
 ```
@@ -244,11 +246,10 @@ git diff --check
 测试覆盖内容合同、运行时授权、TTS/ASR 边界、音频规范化、字幕、四图分镜、代表图门禁、Remotion 渲染、FFmpeg 合成、封面和最终批准记录。真实云端账号、额度和审美判断仍需使用者自行验收。
 
 ## 许可证与致谢
-借鉴了 @gnipbao 大佬的插画开源项目，特此感谢。
 
 项目主体采用 [MIT License](LICENSE)。内置渲染器、画风定义和字体保留各自许可证，详情见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-欢迎大家去二创完善，任何一个模块都是可以自定义修改 替换 甚至开发升级的。期待大家的版本，记得回来@我分享！
+欢迎提交范围明确的 Issue 和 Pull Request。参与前请先读 [CONTRIBUTING.md](CONTRIBUTING.md) 与 [SECURITY.md](SECURITY.md)。
 
 <div align="center">
 
